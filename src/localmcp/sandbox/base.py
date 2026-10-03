@@ -15,6 +15,40 @@ MAX_COMMAND_CHARACTERS = 16_000
 MAX_OPEN_FILES = 256
 MAX_ADDITIONAL_PROCESSES = 256
 
+# Commands for reading, searching and comparing files: the default sandbox tools.
+INSPECTION_TOOLS = (
+    "awk",
+    "basename",
+    "cat",
+    "cmp",
+    "comm",
+    "cut",
+    "diff",
+    "dirname",
+    "du",
+    "file",
+    "find",
+    "grep",
+    "head",
+    "ls",
+    "nl",
+    "od",
+    "paste",
+    "readlink",
+    "realpath",
+    "sed",
+    "sort",
+    "stat",
+    "tail",
+    "tr",
+    "uniq",
+    "wc",
+    "xargs",
+)
+# Commands for managing files, for sandboxes with read-write roots. Root access, not this
+# list, decides what commands can write: the shell and ``sed -i`` can write without them.
+WRITE_TOOLS = ("chmod", "cp", "ln", "mkdir", "mv", "patch", "rm", "rmdir", "tee", "touch")
+
 
 class SandboxError(RuntimeError):
     """Raised when a sandbox cannot be constructed or invoked safely."""
@@ -41,16 +75,32 @@ class SandboxProfile:
 
     The first root is the process working directory. ``ipc`` permits
     shared-memory IPC only, not sockets or platform service protocols.
+    ``tools`` lists every command that commands may run besides shell
+    builtins, such as ``(*INSPECTION_TOOLS, "git")``, and defaults to
+    ``INSPECTION_TOOLS``. The backend lets only these run, grants read-only
+    access to only what each one needs, and rejects tools that are not
+    installed. ``optional_tools`` are granted the same way when they are
+    installed; one that is not grants nothing instead of failing.
     """
 
     roots: tuple[SandboxRoot, ...]
     denied_paths: tuple[Path, ...] = ()
     network: bool = False
     ipc: bool = False
+    tools: tuple[str, ...] = INSPECTION_TOOLS
+    optional_tools: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.roots:
             raise SandboxError("sandbox profile must declare at least one root")
+        for kind, tools in (("tools", self.tools), ("optional tools", self.optional_tools)):
+            if isinstance(tools, str):
+                raise SandboxError(f"sandbox {kind} must be a sequence of command names")
+            for tool in tools:
+                if tool in {"", ".", ".."} or "/" in tool or "\0" in tool:
+                    raise SandboxError(f"sandbox tool must be a command name: {tool!r}")
+        if both := sorted(set(self.tools) & set(self.optional_tools)):
+            raise SandboxError(f"sandbox tools cannot be both required and optional: {', '.join(both)}")
 
 
 class CommandResult(BaseModel):

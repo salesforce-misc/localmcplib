@@ -3,9 +3,11 @@
 from localmcp.sandbox.base import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MAX_OUTPUT_BYTES,
+    INSPECTION_TOOLS,
     MAX_ADDITIONAL_PROCESSES,
     MAX_COMMAND_CHARACTERS,
     MAX_OPEN_FILES,
+    WRITE_TOOLS,
     CommandResult,
     RootAccess,
     Sandbox,
@@ -17,6 +19,7 @@ from localmcp.sandbox.base import (
 __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_SECONDS",
     "DEFAULT_MAX_OUTPUT_BYTES",
+    "INSPECTION_TOOLS",
     "MAX_ADDITIONAL_PROCESSES",
     "MAX_COMMAND_CHARACTERS",
     "MAX_OPEN_FILES",
@@ -26,4 +29,5 @@ __all__ = [
     "SandboxError",
     "SandboxProfile",
     "SandboxRoot",
+    "WRITE_TOOLS",
 ]

@@ -150,9 +150,70 @@ wrapped in one Markdown JSON fence, still validated against the same schema.
 ### Sandboxing
 
 The sandbox API provides bounded command execution with explicit filesystem
-roots, a clean environment, output and time limits, process-group cleanup, and
-network access disabled by default. The current implementation uses macOS
-Seatbelt; the portable interface leaves room for a future Linux backend.
+roots, a clean environment, a private temporary directory per command, output
+and time limits, and network access disabled by default. When a command returns
+or times out, every process it started is killed, including background and
+detached ones. The current implementation uses macOS Seatbelt; the portable
+interface leaves room for a future Linux backend.
+
+Nothing limits how much a command writes. Its temporary directory is writable
+only when the profile has a read-write root, so a read-only profile gets no
+space to fill. The directory is created in the caller's temporary directory,
+which must be outside every root, so what a command writes there counts against
+that volume rather than against any quota on a root's.
+
+`denied_paths` hide files and directories inside the roots. Seatbelt denies the
+real path a file is opened by, so a denied path must not go through a symlink,
+and a denied file must have no other hard link, whose name would stay readable.
+The sandbox refuses to be created, or to run a command, while a denied path
+breaks either rule or cannot be checked, such as when it holds a directory the
+caller cannot list.
+
+A profile's `tools` are the complete list of commands its commands may run
+besides shell builtins; anything else fails with "Operation not permitted",
+including when a listed tool such as `awk`, `find` or `xargs` tries to run it,
+and so do programs copied or written into a root. The default,
+`INSPECTION_TOOLS`, covers reading, searching and comparing files. Extend it
+with what an agent needs, such as
+`SandboxProfile(..., tools=(*INSPECTION_TOOLS, *WRITE_TOOLS, "git"))`, or pass
+`tools=()` to allow builtins only. `WRITE_TOOLS` adds `cp`, `mv`, `rm` and other
+file-management commands for read-write roots. It does not decide what can
+write: root access does, and the shell and `sed -i` can write without it.
+
+On macOS each tool is also granted read-only access to the code it runs from,
+and nothing else:
+
+- A command provided by a Homebrew formula brings that formula's install and the
+  installs of its runtime dependencies. The rest of the Homebrew prefix stays
+  unreadable, including other formulae and its `etc`, `share` and `var`.
+- A command provided by the system-selected Xcode or Command Line Tools install,
+  such as `git`, `python3`, `clang` or `make`, brings that install and Xcode's
+  license record, and its `/usr/bin` shim may run too.
+- A base-system command needs nothing more. A `/usr/bin` developer shim is not
+  one, so a developer tool is not installed unless the selected install
+  provides it. Any other command is an error when the sandbox is created.
+
+A tool may also run its own helper programs, which its install keeps in a
+`libexec` directory named after it, such as git's `git-core`. A script runs its
+`#!` interpreter only for itself, so listing `shasum` does not allow `perl -e`.
+A script that starts with `#!/usr/bin/env` also needs the command `env` runs
+listed.
+
+Commands the sandbox can do without belong in `optional_tools`, such as
+`SandboxProfile(..., tools=(*INSPECTION_TOOLS, "git"), optional_tools=("rg",))`.
+Each one that is installed is granted in the same way. One that is missing or
+broken grants nothing and does not fail the sandbox, so a command that runs it
+fails with "command not found". The default description of the Bash tool from
+`sandbox_tools` lists only the tools that can run.
+
+Homebrew is found only at its default prefixes, and the developer install only
+through `xcode-select`. Neither `HOMEBREW_PREFIX`, `DEVELOPER_DIR` nor the
+caller's `PATH` is consulted, so the caller's environment cannot widen these
+grants, and tools installed elsewhere, such as under `~/.cargo/bin`, are not
+available. Configuration a tool reads from outside its own install, such as
+Homebrew OpenSSL's `etc/openssl@3`, is not granted either. The exception is a
+profile with `network`, which also grants the system TLS configuration and
+trust store in `/etc/ssl`, without which the system `curl` cannot start.
 
 ### Durable workflows
 
