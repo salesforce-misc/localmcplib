@@ -14,7 +14,7 @@ from fastmcp.tools import tool
 import localmcp
 import localmcp.server as server_module
 from localmcp.config import ConfigError, ServerConfig
-from localmcp.llm import ConfiguredModelFactory, ModelFactory, ModelSpec
+from localmcp.llm import DEFAULT_RESPONSE_TIMEOUT, ConfiguredModelFactory, ModelFactory, ModelSpec
 from localmcp.observability.telemetry import LangfuseTelemetry
 from localmcp.server import RuntimeUnavailableError, current_runtime, main
 
@@ -163,8 +163,26 @@ async def test_start_composes_config_secrets_models_telemetry_and_state(tmp_path
     assert isinstance(runtime.model_factory, ConfiguredModelFactory)
     assert runtime.model_factory.config.backend == "openai_compatible"
     assert runtime.model_factory.config.base_url == "https://llm.example.test/v1"
+    assert runtime.model_factory.config.response_timeout == DEFAULT_RESPONSE_TIMEOUT
     async with runtime.model_factory.create("gpt-5.6") as model:
         assert model is not None
+
+
+async def test_llm_transport_settings_reach_the_backend_config(tmp_path: Path) -> None:
+    env = _write_document(tmp_path)
+    path = tmp_path / "config/localmcp/localmcp.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8").replace("[llm]\n", "[llm]\nresponse_timeout = 90\nstream_usage = false\n", 1),
+        encoding="utf-8",
+    )
+
+    await _server().start_runtime(env=env, home=tmp_path)
+
+    model_factory = current_runtime(_Runtime).model_factory
+    assert isinstance(model_factory, ConfiguredModelFactory)
+    assert model_factory.config.response_timeout == 90.0
+    assert model_factory.config.gateway_endpoint().response_timeout == 90.0
+    assert model_factory.config.gateway_endpoint().stream_usage is False
 
 
 async def test_start_without_application_parser_uses_effective_application_config(tmp_path: Path) -> None:
@@ -365,6 +383,14 @@ def test_run_reports_config_error_to_stderr(
         ),
         ("[llm]\nbackend = 'native'\nverify = 1", "llm.verify must be a boolean or string"),
         ("[llm]\nbackend = 'native'\nkeepalive_expiry = true", "llm.keepalive_expiry must be a number"),
+        ("[llm]\nbackend = 'native'\nkeepalive_expiry = -1", "llm: keepalive_expiry must be non-negative"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = true", "llm.response_timeout must be a number"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = '600'", "llm.response_timeout must be a number"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = 0", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = inf", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = nan", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'openai_compatible'", "llm: openai_compatible LLM backend requires base_url"),
+        ("[llm]\nbackend = 'native'\nstream_usage = 'no'", "llm.stream_usage must be a boolean"),
         ("observability = 'invalid'\n[llm]\nbackend = 'native'", "observability must be a TOML table"),
         (
             "[llm]\nbackend = 'native'\n[observability]\nunexpected = true",
@@ -387,7 +413,7 @@ def test_load_config_rejects_invalid_shared_settings(
     path.write_text(shared_config)
     env = {"XDG_CONFIG_HOME": str(config_home)}
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ConfigError, match=re.escape(message)):
         _server().load_config(env=env, home=tmp_path)
 
 
@@ -409,6 +435,9 @@ temperature = "zero"
 
 [llm.models."claude-via-openai"]
 dialect = "openai"
+
+[llm.models."claude-small"]
+max_output_tokens = 8192
 """,
         encoding="utf-8",
     )
@@ -417,13 +446,20 @@ dialect = "openai"
     await server.start_runtime(env=env, home=tmp_path)
     factory = current_runtime(_Runtime).model_factory
 
-    assert factory.validate("claude-opus-5") == ModelSpec(temperature="omit", native_provider="anthropic")
-    assert factory.validate("gpt-7").default_reasoning_effort == "medium"
-    assert factory.validate("house-model") == ModelSpec(temperature="zero", dialect="anthropic")
-    assert factory.validate("claude-via-openai") == ModelSpec(
-        temperature="omit", native_provider="anthropic", dialect="openai"
+    assert factory.validate("claude-opus-5") == ModelSpec(
+        temperature="omit", supports_reasoning_effort=True, native_provider="anthropic"
     )
-    assert factory.validate("claude-sonnet-4-6") == ModelSpec(native_provider="anthropic")
+    assert factory.validate("gpt-7").default_reasoning_effort == "medium"
+    assert factory.validate("house-model") == ModelSpec(
+        temperature="zero", supports_reasoning_effort=True, dialect="anthropic"
+    )
+    assert factory.validate("claude-via-openai") == ModelSpec(
+        temperature="omit", supports_reasoning_effort=True, native_provider="anthropic", dialect="openai"
+    )
+    assert factory.validate("claude-small").max_output_tokens == 8192
+    assert factory.validate("claude-sonnet-4-6") == ModelSpec(
+        supports_reasoning_effort=True, native_provider="anthropic"
+    )
 
 
 @pytest.mark.parametrize(
@@ -435,9 +471,12 @@ dialect = "openai"
         ("[llm.models.m]\ndialect = 'gemini'", "llm.models.m.dialect must be one of: anthropic, openai"),
         ("[llm.models.m]\nsupports_reasoning_effort = 'yes'", "supports_reasoning_effort must be a boolean"),
         ("[llm.models.m]\ndefault_reasoning_effort = 1", "default_reasoning_effort must be a string"),
+        ("[llm.models.m]\nmax_output_tokens = 0", "llm.models.m: max_output_tokens must be a positive integer"),
+        ("[llm.models.m]\nmax_output_tokens = true", "llm.models.m.max_output_tokens must be an integer"),
+        ("[llm.models.m]\nmax_output_tokens = '8k'", "llm.models.m.max_output_tokens must be an integer"),
         (
-            "[llm.models.m]\ndialect = 'anthropic'\nsupports_reasoning_effort = true",
-            "llm.models.m: reasoning_effort is supported only by the OpenAI dialect",
+            "[llm.models.m]\nsupports_reasoning_effort = false\ndefault_reasoning_effort = 'high'",
+            "llm.models.m: default_reasoning_effort requires supports_reasoning_effort=True",
         ),
         ('[llm.models." "]\ntemperature = "omit"', "llm.models: model IDs must not be blank"),
     ],

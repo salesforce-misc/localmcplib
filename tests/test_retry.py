@@ -67,6 +67,117 @@ def test_only_transient_faults_are_retryable() -> None:
     assert not is_retryable_error(ValueError("validation"))
 
 
+class _CutOffStream(httpx.AsyncByteStream):
+    """A response body that drops the connection after its first event."""
+
+    def __init__(self, first: bytes) -> None:
+        self._first = first
+
+    async def __aiter__(self) -> Any:
+        yield self._first
+        raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+
+def _event_stream(body: bytes | httpx.AsyncByteStream) -> httpx.AsyncClient:
+    def respond(request: httpx.Request) -> httpx.Response:
+        headers = {"content-type": "text/event-stream"}
+        if isinstance(body, bytes):
+            return httpx.Response(200, headers=headers, content=body)
+        return httpx.Response(200, headers=headers, stream=body)
+
+    return httpx.AsyncClient(transport=httpx.MockTransport(respond))
+
+
+async def _anthropic_stream_failure(body: bytes | httpx.AsyncByteStream) -> BaseException:
+    client = anthropic.AsyncAnthropic(api_key="token", http_client=_event_stream(body), max_retries=0)
+    with pytest.raises(Exception) as caught:
+        stream = await client.messages.create(
+            model="claude-example",
+            max_tokens=16,
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        async for _ in stream:
+            pass
+    return caught.value
+
+
+async def _openai_stream_failure(body: bytes) -> BaseException:
+    client = openai.AsyncOpenAI(api_key="token", http_client=_event_stream(body), max_retries=0)
+    with pytest.raises(Exception) as caught:
+        stream = await client.chat.completions.create(
+            model="gpt-example",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+        )
+        async for _ in stream:
+            pass
+    return caught.value
+
+
+def _anthropic_error_event(error_type: str) -> bytes:
+    return (
+        f'event: error\ndata: {{"type": "error", "error": {{"type": "{error_type}", "message": "failed"}}}}\n\n'
+    ).encode()
+
+
+def _openai_error_event(error: str) -> bytes:
+    return f'data: {{"error": {{"message": "failed", {error}}}}}\n\n'.encode()
+
+
+@pytest.mark.parametrize("error_type", ["overloaded_error", "api_error", "rate_limit_error"])
+async def test_a_transient_anthropic_error_inside_a_stream_is_retryable(error_type: str) -> None:
+    exc = await _anthropic_stream_failure(_anthropic_error_event(error_type))
+
+    assert getattr(exc, "status_code", None) == 200
+    assert is_retryable_error(exc)
+    assert is_rate_limit_error(exc) == (error_type == "rate_limit_error")
+
+
+@pytest.mark.parametrize(
+    "error",
+    ['"type": "server_error", "code": null', '"type": "None", "code": "500"', '"code": "rate_limit_exceeded"'],
+)
+async def test_a_transient_openai_dialect_error_inside_a_stream_is_retryable(error: str) -> None:
+    exc = await _openai_stream_failure(_openai_error_event(error))
+
+    assert isinstance(exc, openai.APIError)
+    assert is_retryable_error(exc)
+    assert is_rate_limit_error(exc) == ("rate_limit" in error)
+
+
+async def test_a_deterministic_error_inside_a_stream_is_not_retryable() -> None:
+    anthropic_exc = await _anthropic_stream_failure(_anthropic_error_event("invalid_request_error"))
+    openai_exc = await _openai_stream_failure(_openai_error_event('"type": "invalid_request_error", "code": "400"'))
+
+    assert not is_retryable_error(anthropic_exc)
+    assert not is_retryable_error(openai_exc)
+
+
+@pytest.mark.parametrize("code", ["\u00b2", "9" * 5_000, "5000"], ids=["superscript", "oversized", "four-digit"])
+async def test_a_malformed_error_code_inside_a_stream_is_not_retryable(code: str) -> None:
+    # Neither a non-ASCII digit nor a code too long for int() is an HTTP status.
+    exc = await _openai_stream_failure(_openai_error_event(f'"type": "None", "code": "{code}"'))
+
+    assert not is_retryable_error(exc)
+
+
+async def test_a_stream_cut_off_mid_response_is_retryable() -> None:
+    start = b'event: ping\ndata: {"type": "ping"}\n\n'
+    exc = await _anthropic_stream_failure(_CutOffStream(start))
+
+    assert isinstance(exc, httpx.RemoteProtocolError)
+    assert is_retryable_error(exc)
+    assert not is_rate_limit_error(exc)
+
+
+def test_a_status_error_keeps_its_http_classification() -> None:
+    body = {"type": "error", "error": {"type": "api_error", "message": "bad"}}
+    rejected = anthropic.BadRequestError("bad", response=_response(400), body=body)
+
+    assert not is_retryable_error(rejected)
+
+
 def test_a_retry_after_header_sets_the_delay_up_to_the_maximum() -> None:
     short = openai.RateLimitError("rl", response=_response(429, {"retry-after": "7"}), body=None)
     long = anthropic.RateLimitError("rl", response=_response(429, {"retry-after": "900"}), body=None)
