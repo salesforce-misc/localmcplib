@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -292,12 +291,8 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     if isinstance(keepalive_expiry, bool) or not isinstance(keepalive_expiry, int | float):
         raise ConfigError("llm.keepalive_expiry must be a number")
     response_timeout = llm.get("response_timeout", DEFAULT_RESPONSE_TIMEOUT)
-    if (
-        isinstance(response_timeout, bool)
-        or not isinstance(response_timeout, int | float)
-        or not (math.isfinite(response_timeout) and response_timeout > 0)
-    ):
-        raise ConfigError("llm.response_timeout must be a finite positive number")
+    if isinstance(response_timeout, bool) or not isinstance(response_timeout, int | float):
+        raise ConfigError("llm.response_timeout must be a number")
     stream_usage = llm.get("stream_usage", True)
     if not isinstance(stream_usage, bool):
         raise ConfigError("llm.stream_usage must be a boolean")
@@ -311,8 +306,10 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     if not isinstance(log_level, str):
         raise ConfigError("observability.log_level must be a string")
 
-    return _ServerSettings(
-        llm=LLMBackendConfig(
+    # The backend config owns the value rules, such as a finite positive
+    # response timeout or a gateway base_url.
+    try:
+        backend_config = LLMBackendConfig(
             backend=selected_backend,
             base_url=base_url,
             default_headers=headers,
@@ -320,7 +317,11 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
             keepalive_expiry=float(keepalive_expiry),
             response_timeout=float(response_timeout),
             stream_usage=stream_usage,
-        ),
+        )
+    except ModelConfigurationError as exc:
+        raise ConfigError(f"llm: {exc}") from exc
+    return _ServerSettings(
+        llm=backend_config,
         registry=registry,
         observability=_ObservabilitySettings(log_level=log_level),
     )
@@ -369,8 +370,8 @@ def _parse_model_specs(models: Mapping[str, object]) -> ModelRegistry:
             updates["default_reasoning_effort"] = entry["default_reasoning_effort"]
         if "max_output_tokens" in entry:
             value = entry["max_output_tokens"]
-            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-                raise ConfigError(f"{field}.max_output_tokens must be a positive integer")
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(f"{field}.max_output_tokens must be an integer")
             updates["max_output_tokens"] = value
         base = catalog.get(model_id) or infer_model_spec(model_id)
         try:

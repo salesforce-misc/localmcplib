@@ -345,8 +345,10 @@ def test_configured_factory_validates_backend_compatibility_without_constructing
 def test_model_specs_reject_inconsistent_capabilities() -> None:
     with pytest.raises(ModelConfigurationError, match="requires supports_reasoning_effort"):
         ModelSpec(default_reasoning_effort="medium")
-    with pytest.raises(ModelConfigurationError, match="max_output_tokens must be positive"):
+    with pytest.raises(ModelConfigurationError, match="max_output_tokens must be a positive integer"):
         ModelSpec(max_output_tokens=0)
+    with pytest.raises(ModelConfigurationError, match="max_output_tokens must be a positive integer"):
+        ModelSpec(max_output_tokens=True)
 
     assert ModelSpec(native_provider="anthropic").adapter_dialect == "anthropic"
     assert ModelSpec().adapter_dialect == "openai"
@@ -371,10 +373,12 @@ def test_registry_rejects_blank_ids_and_returns_a_defensive_mapping() -> None:
         lambda: NativeTransport(keepalive_expiry=-1),
         lambda: GatewayEndpoint("https://example.test", response_timeout=0),
         lambda: GatewayEndpoint("https://example.test", response_timeout=float("inf")),
+        lambda: GatewayEndpoint("https://example.test", response_timeout=True),
         lambda: NativeTransport(response_timeout=-1),
         lambda: NativeTransport(response_timeout=float("nan")),
         lambda: LLMBackendConfig(backend="native", response_timeout=0),
         lambda: response_deadline_http_client(response_timeout=float("nan")),
+        lambda: response_deadline_http_client(response_timeout=True),
         lambda: LLMBackendConfig(backend="unsupported"),  # type: ignore[arg-type]
         lambda: LLMBackendConfig(backend="openai_compatible", base_url="https://example.test", keepalive_expiry=-1),
     ],
@@ -418,6 +422,7 @@ def test_backend_config_exposes_only_the_selected_transport() -> None:
             ModelRegistry(), OpenAICompatibleEndpoint("https://example.test"), "token", default_max_output_tokens=0
         ),
         lambda: NativeModelFactory(ModelRegistry(), default_max_output_tokens=0),
+        lambda: NativeModelFactory(ModelRegistry(), default_max_output_tokens=True),
         lambda: ConfiguredModelFactory(
             ModelRegistry(),
             LLMBackendConfig(backend="openai_compatible", base_url="https://example.test"),
@@ -427,7 +432,7 @@ def test_backend_config_exposes_only_the_selected_transport() -> None:
     ],
 )
 def test_factories_reject_non_positive_default_output_limits(factory: Any) -> None:
-    with pytest.raises(ModelConfigurationError, match="must be positive"):
+    with pytest.raises(ModelConfigurationError, match="must be a positive integer"):
         factory()
 
 
@@ -445,8 +450,9 @@ def test_create_rejects_non_positive_per_call_output_limit_before_transport() ->
         "token",
         http_client_factory=client_factory,
     )
-    with pytest.raises(ModelConfigurationError, match="must be positive"):
-        factory.create("model", max_output_tokens=0)
+    for invalid in (0, True):
+        with pytest.raises(ModelConfigurationError, match="must be a positive integer"):
+            factory.create("model", max_output_tokens=invalid)
     assert not constructed
 
 
@@ -510,11 +516,75 @@ _OPENAI_STREAM = [
 ]
 
 
+def _anthropic_tool_use_events() -> list[tuple[str, dict[str, Any]]]:
+    events: list[tuple[str, dict[str, Any]]] = [_ANTHROPIC_STREAM[0]]
+    for index, (call_id, finding) in enumerate([("toolu_1", "F1"), ("toolu_2", "F2")]):
+        events += [
+            (
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": call_id, "name": "record", "input": {}},
+                },
+            ),
+            *(
+                (
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": part},
+                    },
+                )
+                for part in (f'{{"finding_id": "{finding}",', ' "decision": "keep"}')
+            ),
+            ("content_block_stop", {"type": "content_block_stop", "index": index}),
+        ]
+    return [
+        *events,
+        (
+            "message_delta",
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                "usage": {"output_tokens": 30},
+            },
+        ),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+
+
+def _openai_tool_call_chunks() -> list[dict[str, Any]]:
+    chunks = [_openai_chunk({"role": "assistant", "content": None})]
+    for index, (call_id, finding) in enumerate([("call_1", "F1"), ("call_2", "F2")]):
+        start = {"index": index, "id": call_id, "type": "function", "function": {"name": "record", "arguments": ""}}
+        chunks.append(_openai_chunk({"tool_calls": [start]}))
+        for part in (f'{{"finding_id": "{finding}",', ' "decision": "keep"}'):
+            chunks.append(_openai_chunk({"tool_calls": [{"index": index, "function": {"arguments": part}}]}))
+    return [*chunks, _openai_chunk({}, finish_reason="tool_calls"), _OPENAI_STREAM[-1]]
+
+
+_RECORD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "record",
+        "description": "Record one decision.",
+        "parameters": {
+            "type": "object",
+            "properties": {"finding_id": {"type": "string"}, "decision": {"type": "string"}},
+            "required": ["finding_id", "decision"],
+        },
+    },
+}
+
+
 class RecordingGateway:
     """Serve one canned event stream per request and record each request body."""
 
-    def __init__(self, dialect: str) -> None:
+    def __init__(self, dialect: str, stream: list[Any] | None = None) -> None:
         self.dialect = dialect
+        self.stream = stream
         self.requests: list[dict[str, Any]] = []
 
     def __call__(self, _: GatewayEndpoint) -> httpx2.AsyncClient:
@@ -523,9 +593,11 @@ class RecordingGateway:
     def _respond(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(json.loads(request.content))
         if self.dialect == "anthropic":
-            body = "".join(f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in _ANTHROPIC_STREAM)
+            events = self.stream or _ANTHROPIC_STREAM
+            body = "".join(f"event: {event}\ndata: {json.dumps(data)}\n\n" for event, data in events)
         else:
-            body = "".join(f"data: {json.dumps(data)}\n\n" for data in _OPENAI_STREAM) + "data: [DONE]\n\n"
+            chunks = self.stream or _OPENAI_STREAM
+            body = "".join(f"data: {json.dumps(data)}\n\n" for data in chunks) + "data: [DONE]\n\n"
         return httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body.encode())
 
 
@@ -543,9 +615,11 @@ async def _invoke(
     *,
     endpoint: GatewayEndpoint | None = None,
     default_max_output_tokens: int | None = None,
+    stream: list[Any] | None = None,
+    tools: list[dict[str, Any]] | None = None,
     **create: Any,
 ) -> tuple[dict[str, Any], AIMessage]:
-    gateway = RecordingGateway(dialect)
+    gateway = RecordingGateway(dialect, stream)
     factory = GatewayModelFactory(
         registry,
         endpoint or GatewayEndpoint("https://gateway.example/v1"),
@@ -554,7 +628,7 @@ async def _invoke(
         default_max_output_tokens=default_max_output_tokens,
     )
     async with factory.create(model_id, **create) as model:
-        message = await model.ainvoke("hi")
+        message = await (model.bind_tools(tools) if tools else model).ainvoke("hi")
     [request] = gateway.requests
     return request, message
 
@@ -574,6 +648,56 @@ async def test_anthropic_models_stream_and_return_one_reassembled_message() -> N
     assert message.response_metadata["stop_reason"] == "max_tokens"
     assert message.usage_metadata is not None
     assert message.usage_metadata["output_tokens"] == 5
+
+
+_RECORDED_CALLS = [{"finding_id": "F1", "decision": "keep"}, {"finding_id": "F2", "decision": "keep"}]
+
+
+@pytest.mark.usefixtures("_no_provider_environment")
+@pytest.mark.parametrize(
+    ("dialect", "spec", "stream", "call_ids"),
+    [
+        ("anthropic", ModelSpec(native_provider="anthropic"), _anthropic_tool_use_events(), ["toolu_1", "toolu_2"]),
+        ("openai", ModelSpec(native_provider="openai"), _openai_tool_call_chunks(), ["call_1", "call_2"]),
+    ],
+)
+async def test_streamed_tool_calls_reassemble_into_complete_calls(
+    dialect: str, spec: ModelSpec, stream: list[Any], call_ids: list[str]
+) -> None:
+    registry = ModelRegistry({"model": spec})
+
+    request, message = await _invoke(registry, dialect, "model", stream=stream, tools=[_RECORD_TOOL])
+
+    assert request["stream"] is True
+    assert [tool.get("name") or tool["function"]["name"] for tool in request["tools"]] == ["record"]
+    assert [(call["id"], call["name"], call["args"]) for call in message.tool_calls] == [
+        (call_id, "record", args) for call_id, args in zip(call_ids, _RECORDED_CALLS, strict=True)
+    ]
+    assert not message.invalid_tool_calls
+
+
+@pytest.mark.usefixtures("_no_provider_environment")
+async def test_any_effort_on_an_anthropic_model_omits_the_catalogued_temperature() -> None:
+    registry = ModelRegistry(
+        {
+            "claude-default": ModelSpec(
+                supports_reasoning_effort=True, default_reasoning_effort="medium", native_provider="anthropic"
+            ),
+            "claude-translated": ModelSpec(
+                supports_reasoning_effort=True, native_provider="anthropic", dialect="openai"
+            ),
+        }
+    )
+
+    default, _ = await _invoke(registry, "anthropic", "claude-default")
+    translated, _ = await _invoke(registry, "openai", "claude-translated", reasoning_effort="high")
+    without_effort, _ = await _invoke(registry, "openai", "claude-translated")
+
+    assert default["output_config"] == {"effort": "medium"}
+    assert "temperature" not in default
+    assert translated["reasoning_effort"] == "high"
+    assert "temperature" not in translated
+    assert without_effort["temperature"] == 0
 
 
 @pytest.mark.usefixtures("_no_provider_environment")

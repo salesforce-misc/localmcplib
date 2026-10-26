@@ -77,13 +77,14 @@ transport, so its clients enforce the response timeout described below only
 when built with `localmcp.llm.response_deadline_http_client`.
 
 Every model streams its responses, and LangChain reassembles each into one
-message with its usage and stop reason, so callers see an ordinary response. A
-long generation therefore never waits on one idle read, and the Anthropic SDK
-does not refuse a large output limit for lack of streaming. Without a per-call
-or factory-wide `max_output_tokens`, a model may generate up to its maximum:
-the catalogued `max_output_tokens` when declared, otherwise the provider's own
-limit. A factory-wide limit never raises a model above its catalogued maximum;
-a per-call limit is sent as given. Anthropic models, which require an explicit
+message with its stop reason, tool calls, and usage when the provider reports
+it, so callers see an ordinary response. A long generation therefore never
+waits on one idle read, and the Anthropic SDK does not refuse a large output
+limit for lack of streaming. Without a per-call or factory-wide
+`max_output_tokens`, a model may generate up to its maximum: the catalogued
+`max_output_tokens` when declared, otherwise the provider's own limit. A
+factory-wide limit never raises a model above its catalogued maximum; a
+per-call limit is sent as given. Anthropic models, which require an explicit
 limit, take it from `ChatAnthropic`'s model profile, or 64,000 tokens for a
 model it does not know; catalogue `max_output_tokens` for an Anthropic-dialect
 model that accepts fewer.
@@ -129,7 +130,10 @@ inferred capabilities and log one warning:
 A reasoning effort reaches OpenAI-dialect models as `reasoning_effort` and
 Anthropic models as `output_config.effort`; both accept the same level names,
 and the provider rejects a level the model lacks. On Anthropic models an effort
-also enables adaptive thinking, so a catalogued zero temperature is omitted.
+also enables adaptive thinking, which rejects a temperature. Whenever such a
+model receives an effort, whether requested or its `default_reasoning_effort`,
+a catalogued zero temperature is therefore omitted; this includes an Anthropic
+model that a gateway serves through the OpenAI dialect.
 
 `[llm.models."<model-id>"]` declares or corrects a model without a library
 release. Each entry updates only the fields it names, starting from the

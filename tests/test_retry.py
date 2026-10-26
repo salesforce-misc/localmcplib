@@ -154,6 +154,14 @@ async def test_a_deterministic_error_inside_a_stream_is_not_retryable() -> None:
     assert not is_retryable_error(openai_exc)
 
 
+@pytest.mark.parametrize("code", ["\u00b2", "9" * 5_000, "5000"], ids=["superscript", "oversized", "four-digit"])
+async def test_a_malformed_error_code_inside_a_stream_is_not_retryable(code: str) -> None:
+    # Neither a non-ASCII digit nor a code too long for int() is an HTTP status.
+    exc = await _openai_stream_failure(_openai_error_event(f'"type": "None", "code": "{code}"'))
+
+    assert not is_retryable_error(exc)
+
+
 async def test_a_stream_cut_off_mid_response_is_retryable() -> None:
     start = b'event: ping\ndata: {"type": "ping"}\n\n'
     exc = await _anthropic_stream_failure(_CutOffStream(start))

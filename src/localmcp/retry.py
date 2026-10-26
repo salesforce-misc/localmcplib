@@ -63,6 +63,12 @@ def _stream_error_kinds(exc: BaseException) -> set[str]:
     return {str(error[key]) for key in ("type", "code") if error.get(key) is not None}
 
 
+def _is_server_error_code(kind: str) -> bool:
+    # An HTTP status code. str.isdigit() alone also accepts digits such as "²",
+    # which int() rejects.
+    return len(kind) == 3 and kind.isascii() and kind.isdigit() and int(kind) >= 500
+
+
 def is_rate_limit_error(exc: BaseException) -> bool:
     """Return True when ``exc`` is a provider or gateway 429 rejection."""
     if isinstance(exc, (anthropic.RateLimitError, openai.RateLimitError)):
@@ -86,7 +92,7 @@ def is_retryable_error(exc: BaseException) -> bool:
     if isinstance(status, int) and status >= 500:
         return True
     kinds = _stream_error_kinds(exc)
-    if kinds & _TRANSIENT_STREAM_ERRORS or any(kind.isdigit() and int(kind) >= 500 for kind in kinds):
+    if kinds & _TRANSIENT_STREAM_ERRORS or any(_is_server_error_code(kind) for kind in kinds):
         return True
     # Each SDK's timeout error subclasses its connection error.
     return isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError, *_TRANSIENT_STREAM_FAULTS))

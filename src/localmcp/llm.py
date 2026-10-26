@@ -11,7 +11,10 @@ import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    import httpx2
 
 TemperaturePolicy = Literal["zero", "omit"]
 NativeProvider = Literal["anthropic", "openai"]
@@ -24,6 +27,11 @@ _warned_unregistered: set[str] = set()
 
 class ModelConfigurationError(ValueError):
     """Raised for invalid model specs or model/backend settings."""
+
+
+def _is_token_count(value: int) -> bool:
+    # bool subclasses int, but True is not a token count.
+    return not isinstance(value, bool) and value > 0
 
 
 @dataclass(frozen=True)
@@ -48,8 +56,8 @@ class ModelSpec:
     def __post_init__(self) -> None:
         if self.default_reasoning_effort is not None and not self.supports_reasoning_effort:
             raise ModelConfigurationError("default_reasoning_effort requires supports_reasoning_effort=True")
-        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
-            raise ModelConfigurationError("max_output_tokens must be positive")
+        if self.max_output_tokens is not None and not _is_token_count(self.max_output_tokens):
+            raise ModelConfigurationError("max_output_tokens must be a positive integer")
 
     @property
     def adapter_dialect(self) -> ModelDialect:
@@ -136,8 +144,9 @@ DEFAULT_RESPONSE_TIMEOUT = 600.0
 
 
 def _validate_response_timeout(response_timeout: float) -> None:
-    # inf would disable the deadline and nan would expire it immediately.
-    if not (math.isfinite(response_timeout) and response_timeout > 0):
+    # inf would disable the deadline, nan would expire it immediately, and
+    # True would pass as one second.
+    if isinstance(response_timeout, bool) or not (math.isfinite(response_timeout) and response_timeout > 0):
         raise ModelConfigurationError("response_timeout must be a finite positive number")
 
 
@@ -330,7 +339,7 @@ def _response_deadline_client_type() -> type[Any]:
     return ResponseDeadlineClient
 
 
-def response_deadline_http_client(*, response_timeout: float, **client_kwargs: Any) -> AsyncHTTPClient:
+def response_deadline_http_client(*, response_timeout: float, **client_kwargs: Any) -> httpx2.AsyncClient:
     """Return an ``httpx2.AsyncClient`` that bounds each response to ``response_timeout`` seconds.
 
     The default transports use this client. A custom ``http_client_factory``
@@ -338,7 +347,7 @@ def response_deadline_http_client(*, response_timeout: float, **client_kwargs: A
     are built here; ``client_kwargs`` reach ``httpx2.AsyncClient`` unchanged.
     """
     _validate_response_timeout(response_timeout)
-    client: AsyncHTTPClient = _response_deadline_client_type()(response_timeout=response_timeout, **client_kwargs)
+    client: httpx2.AsyncClient = _response_deadline_client_type()(response_timeout=response_timeout, **client_kwargs)
     return client
 
 
@@ -380,8 +389,8 @@ _UNPROFILED_ANTHROPIC_OUTPUT_TOKENS = 64_000
 
 
 def _validate_default_output_tokens(value: int | None) -> None:
-    if value is not None and value <= 0:
-        raise ModelConfigurationError("default_max_output_tokens must be positive")
+    if value is not None and not _is_token_count(value):
+        raise ModelConfigurationError("default_max_output_tokens must be a positive integer")
 
 
 def _output_tokens(value: int | None, default: int | None, spec: ModelSpec) -> int | None:
@@ -391,8 +400,8 @@ def _output_tokens(value: int | None, default: int | None, spec: ModelSpec) -> i
     every model, so it never raises a model above its catalogued maximum.
     """
     if value is not None:
-        if value <= 0:
-            raise ModelConfigurationError("max_output_tokens must be positive")
+        if not _is_token_count(value):
+            raise ModelConfigurationError("max_output_tokens must be a positive integer")
         return value
     if default is not None and spec.max_output_tokens is not None:
         return min(default, spec.max_output_tokens)

@@ -383,11 +383,13 @@ def test_run_reports_config_error_to_stderr(
         ),
         ("[llm]\nbackend = 'native'\nverify = 1", "llm.verify must be a boolean or string"),
         ("[llm]\nbackend = 'native'\nkeepalive_expiry = true", "llm.keepalive_expiry must be a number"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = true", "llm.response_timeout must be a finite positive"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = '600'", "llm.response_timeout must be a finite positive"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = 0", "llm.response_timeout must be a finite positive"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = inf", "llm.response_timeout must be a finite positive"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = nan", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nkeepalive_expiry = -1", "llm: keepalive_expiry must be non-negative"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = true", "llm.response_timeout must be a number"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = '600'", "llm.response_timeout must be a number"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = 0", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = inf", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = nan", "llm: response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'openai_compatible'", "llm: openai_compatible LLM backend requires base_url"),
         ("[llm]\nbackend = 'native'\nstream_usage = 'no'", "llm.stream_usage must be a boolean"),
         ("observability = 'invalid'\n[llm]\nbackend = 'native'", "observability must be a TOML table"),
         (
@@ -411,7 +413,7 @@ def test_load_config_rejects_invalid_shared_settings(
     path.write_text(shared_config)
     env = {"XDG_CONFIG_HOME": str(config_home)}
 
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ConfigError, match=re.escape(message)):
         _server().load_config(env=env, home=tmp_path)
 
 
@@ -469,8 +471,9 @@ max_output_tokens = 8192
         ("[llm.models.m]\ndialect = 'gemini'", "llm.models.m.dialect must be one of: anthropic, openai"),
         ("[llm.models.m]\nsupports_reasoning_effort = 'yes'", "supports_reasoning_effort must be a boolean"),
         ("[llm.models.m]\ndefault_reasoning_effort = 1", "default_reasoning_effort must be a string"),
-        ("[llm.models.m]\nmax_output_tokens = 0", "max_output_tokens must be a positive integer"),
-        ("[llm.models.m]\nmax_output_tokens = '8k'", "max_output_tokens must be a positive integer"),
+        ("[llm.models.m]\nmax_output_tokens = 0", "llm.models.m: max_output_tokens must be a positive integer"),
+        ("[llm.models.m]\nmax_output_tokens = true", "llm.models.m.max_output_tokens must be an integer"),
+        ("[llm.models.m]\nmax_output_tokens = '8k'", "llm.models.m.max_output_tokens must be an integer"),
         (
             "[llm.models.m]\nsupports_reasoning_effort = false\ndefault_reasoning_effort = 'high'",
             "llm.models.m: default_reasoning_effort requires supports_reasoning_effort=True",
