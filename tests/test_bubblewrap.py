@@ -204,6 +204,32 @@ def test_optional_tool_helper_failure_grants_no_partial_authority(
         linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("broken",)))
 
 
+def test_helper_symlinks_out_of_the_runtime_are_not_scanned(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Distro package trees link data out of the runtime, such as Babel's locale data under /usr/share.
+    system, helpers, share = tmp_path / "system", tmp_path / "lib" / "tool", tmp_path / "share"
+    for directory in (system, helpers, share):
+        directory.mkdir(parents=True)
+    (system / "tool").touch(mode=0o755)
+    helper = helpers / "helper"
+    helper.touch(mode=0o755)
+    data = share / "global.dat"
+    data.touch(mode=0o755)
+    (helpers / "global.dat").symlink_to(data)
+    library = tmp_path / "helper.so"
+    monkeypatch.setattr(linux, "_BIN_DIRECTORIES", (system,))
+    monkeypatch.setattr(linux, "_RUNTIME_TREES", (system, helpers.parent, Path("/bin/sh").resolve().parent))
+    monkeypatch.setattr(linux, "_helpers", lambda name: (helpers,) if name == "tool" else ())
+    monkeypatch.setattr(linux, "_libraries", lambda program: (library,) if program == helper else ())
+    monkeypatch.setattr(linux, "_elf_interpreter", lambda _: None)
+
+    grants = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("tool",)))
+
+    assert grants.names == ("tool",)
+    assert grants.helpers == (helpers,)
+    assert grants.maps == (library,)
+    assert data not in grants.executables
+
+
 def test_script_tools_need_explicit_interpreter(tool_system: Path, tmp_path: Path) -> None:
     interpreter = tool_system / "interpreter"
     interpreter.touch(mode=0o755)

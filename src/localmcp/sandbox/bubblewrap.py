@@ -210,11 +210,14 @@ def _tool_grants(profile: SandboxProfile) -> _Tools:
             if _multicall(resolved):
                 raise SandboxError(f"Linux sandbox cannot restrict individual commands of multicall tool: {name}")
             tool_helpers = _helpers(name)
+            # Landlock grants execution by where a symlink's target lives, and a target
+            # inside a helper tree is scanned itself. Links out of the tree, such as
+            # package data under /usr/share, cannot execute and are skipped, not rejected.
             native_helpers = {
                 _trusted_program(candidate)
                 for tree in tool_helpers
                 for candidate in tree.rglob("*")
-                if candidate.is_file() and os.access(candidate, os.X_OK)
+                if not candidate.is_symlink() and candidate.is_file() and os.access(candidate, os.X_OK)
             }
             code = (interpreter or resolved, *sorted(native_helpers, key=os.fspath))
             libraries = tuple(library for program in code for library in _libraries(program))
