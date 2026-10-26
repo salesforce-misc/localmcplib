@@ -26,6 +26,7 @@ from localmcp.llm import (
     OwnedChatModel,
     _response_deadline_client_type,
     infer_model_spec,
+    response_deadline_http_client,
 )
 from localmcp.retry import is_retryable_error
 
@@ -369,8 +370,11 @@ def test_registry_rejects_blank_ids_and_returns_a_defensive_mapping() -> None:
         lambda: GatewayEndpoint("https://example.test", keepalive_expiry=-1),
         lambda: NativeTransport(keepalive_expiry=-1),
         lambda: GatewayEndpoint("https://example.test", response_timeout=0),
+        lambda: GatewayEndpoint("https://example.test", response_timeout=float("inf")),
         lambda: NativeTransport(response_timeout=-1),
+        lambda: NativeTransport(response_timeout=float("nan")),
         lambda: LLMBackendConfig(backend="native", response_timeout=0),
+        lambda: response_deadline_http_client(response_timeout=float("nan")),
         lambda: LLMBackendConfig(backend="unsupported"),  # type: ignore[arg-type]
         lambda: LLMBackendConfig(backend="openai_compatible", base_url="https://example.test", keepalive_expiry=-1),
     ],
@@ -388,6 +392,7 @@ def test_backend_config_exposes_only_the_selected_transport() -> None:
         verify=False,
         keepalive_expiry=2,
         response_timeout=30,
+        stream_usage=False,
     )
     assert gateway.gateway_endpoint() == GatewayEndpoint(
         "https://gateway.example/v1",
@@ -395,6 +400,7 @@ def test_backend_config_exposes_only_the_selected_transport() -> None:
         verify=False,
         keepalive_expiry=2,
         response_timeout=30,
+        stream_usage=False,
     )
     with pytest.raises(ModelConfigurationError, match="non-native"):
         gateway.native_transport()
@@ -531,11 +537,21 @@ def _no_provider_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 async def _invoke(
-    registry: ModelRegistry, dialect: str, model_id: str, **create: Any
+    registry: ModelRegistry,
+    dialect: str,
+    model_id: str,
+    *,
+    endpoint: GatewayEndpoint | None = None,
+    default_max_output_tokens: int | None = None,
+    **create: Any,
 ) -> tuple[dict[str, Any], AIMessage]:
     gateway = RecordingGateway(dialect)
     factory = GatewayModelFactory(
-        registry, GatewayEndpoint("https://gateway.example/v1"), "token", http_client_factory=gateway
+        registry,
+        endpoint or GatewayEndpoint("https://gateway.example/v1"),
+        "token",
+        http_client_factory=gateway,
+        default_max_output_tokens=default_max_output_tokens,
     )
     async with factory.create(model_id, **create) as model:
         message = await model.ainvoke("hi")
@@ -609,6 +625,43 @@ async def test_openai_dialect_models_stream_usage_and_omit_an_unset_limit() -> N
     assert message.usage_metadata["output_tokens"] == 5
 
 
+@pytest.mark.usefixtures("_no_provider_environment")
+async def test_a_gateway_can_stop_requesting_streamed_usage() -> None:
+    registry = ModelRegistry({"gpt-example": ModelSpec(native_provider="openai")})
+    endpoint = GatewayEndpoint("https://gateway.example/v1", stream_usage=False)
+
+    request, message = await _invoke(registry, "openai", "gpt-example", endpoint=endpoint)
+
+    assert request["stream"] is True
+    assert "stream_options" not in request
+    assert message.text == "Hello"
+
+
+@pytest.mark.usefixtures("_no_provider_environment")
+async def test_a_factory_default_limit_never_exceeds_a_catalogued_maximum() -> None:
+    registry = ModelRegistry(
+        {
+            "gpt-example": ModelSpec(native_provider="openai"),
+            "gpt-small": ModelSpec(native_provider="openai", max_output_tokens=4_096),
+            "claude-small": ModelSpec(native_provider="anthropic", max_output_tokens=8_192),
+        }
+    )
+
+    uncatalogued, _ = await _invoke(registry, "openai", "gpt-example", default_max_output_tokens=10_000)
+    capped, _ = await _invoke(registry, "openai", "gpt-small", default_max_output_tokens=10_000)
+    lower, _ = await _invoke(registry, "openai", "gpt-small", default_max_output_tokens=2_000)
+    requested, _ = await _invoke(
+        registry, "openai", "gpt-small", default_max_output_tokens=2_000, max_output_tokens=6_000
+    )
+    anthropic, _ = await _invoke(registry, "anthropic", "claude-small", default_max_output_tokens=10_000)
+
+    assert uncatalogued["max_completion_tokens"] == 10_000
+    assert capped["max_completion_tokens"] == 4_096
+    assert lower["max_completion_tokens"] == 2_000
+    assert requested["max_completion_tokens"] == 6_000
+    assert anthropic["max_tokens"] == 8_192
+
+
 def test_configured_gateway_requires_its_explicit_credential() -> None:
     with pytest.raises(ModelConfigurationError, match="gateway API key is required"):
         ConfiguredModelFactory(
@@ -652,9 +705,9 @@ class _KeepAliveStream(httpx2.AsyncByteStream):
 
 
 def _deadline_client(handler: Any, response_timeout: float) -> httpx2.AsyncClient:
-    client: httpx2.AsyncClient = _response_deadline_client_type()(
-        response_timeout=response_timeout, transport=httpx2.MockTransport(handler)
-    )
+    # A custom client factory keeps the deadline by building its clients here.
+    client = response_deadline_http_client(response_timeout=response_timeout, transport=httpx2.MockTransport(handler))
+    assert isinstance(client, httpx2.AsyncClient)
     return client
 
 

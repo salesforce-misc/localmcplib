@@ -168,11 +168,11 @@ async def test_start_composes_config_secrets_models_telemetry_and_state(tmp_path
         assert model is not None
 
 
-async def test_llm_response_timeout_reaches_the_backend_config(tmp_path: Path) -> None:
+async def test_llm_transport_settings_reach_the_backend_config(tmp_path: Path) -> None:
     env = _write_document(tmp_path)
     path = tmp_path / "config/localmcp/localmcp.toml"
     path.write_text(
-        path.read_text(encoding="utf-8").replace("[llm]\n", "[llm]\nresponse_timeout = 90\n", 1),
+        path.read_text(encoding="utf-8").replace("[llm]\n", "[llm]\nresponse_timeout = 90\nstream_usage = false\n", 1),
         encoding="utf-8",
     )
 
@@ -182,6 +182,7 @@ async def test_llm_response_timeout_reaches_the_backend_config(tmp_path: Path) -
     assert isinstance(model_factory, ConfiguredModelFactory)
     assert model_factory.config.response_timeout == 90.0
     assert model_factory.config.gateway_endpoint().response_timeout == 90.0
+    assert model_factory.config.gateway_endpoint().stream_usage is False
 
 
 async def test_start_without_application_parser_uses_effective_application_config(tmp_path: Path) -> None:
@@ -382,9 +383,12 @@ def test_run_reports_config_error_to_stderr(
         ),
         ("[llm]\nbackend = 'native'\nverify = 1", "llm.verify must be a boolean or string"),
         ("[llm]\nbackend = 'native'\nkeepalive_expiry = true", "llm.keepalive_expiry must be a number"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = true", "llm.response_timeout must be a positive number"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = '600'", "llm.response_timeout must be a positive number"),
-        ("[llm]\nbackend = 'native'\nresponse_timeout = 0", "llm.response_timeout must be a positive number"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = true", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = '600'", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = 0", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = inf", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nresponse_timeout = nan", "llm.response_timeout must be a finite positive"),
+        ("[llm]\nbackend = 'native'\nstream_usage = 'no'", "llm.stream_usage must be a boolean"),
         ("observability = 'invalid'\n[llm]\nbackend = 'native'", "observability must be a TOML table"),
         (
             "[llm]\nbackend = 'native'\n[observability]\nunexpected = true",

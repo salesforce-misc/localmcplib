@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import re
 import ssl
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -128,26 +129,39 @@ DEFAULT_MODEL_REGISTRY = ModelRegistry(DEFAULT_MODEL_SPECS)
 # Seconds one model response may take, from sending its request to its last
 # streamed byte. Streaming leaves the SDKs' read timeout unable to bound a
 # response: it limits only the wait between bytes, and providers keep sending
-# keep-alive events while a model thinks or stalls.
+# keep-alive events while a model thinks or stalls. The deadline cannot tell a
+# stalled response from a long one, so a model whose uncapped responses
+# routinely take longer needs a larger timeout or an output limit.
 DEFAULT_RESPONSE_TIMEOUT = 600.0
+
+
+def _validate_response_timeout(response_timeout: float) -> None:
+    # inf would disable the deadline and nan would expire it immediately.
+    if not (math.isfinite(response_timeout) and response_timeout > 0):
+        raise ModelConfigurationError("response_timeout must be a finite positive number")
 
 
 def _validate_transport(keepalive_expiry: float, response_timeout: float) -> None:
     if keepalive_expiry < 0:
         raise ModelConfigurationError("keepalive_expiry must be non-negative")
-    if response_timeout <= 0:
-        raise ModelConfigurationError("response_timeout must be positive")
+    _validate_response_timeout(response_timeout)
 
 
 @dataclass(frozen=True)
 class GatewayEndpoint:
-    """Shared endpoint and transport settings for a model gateway."""
+    """Shared endpoint and transport settings for a model gateway.
+
+    ``stream_usage`` asks OpenAI-dialect responses to report token usage, which
+    a streamed response otherwise omits. Disable it only for a gateway that
+    rejects ``stream_options``.
+    """
 
     base_url: str
     default_headers: Mapping[str, str] | None = None
     verify: bool | str | ssl.SSLContext = True
     keepalive_expiry: float = 5.0
     response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
+    stream_usage: bool = True
 
     def __post_init__(self) -> None:
         if not self.base_url.strip():
@@ -174,7 +188,8 @@ class LLMBackendConfig:
     The library deliberately does not infer a backend from available keys.
     ``base_url`` is required only for ``openai_compatible`` and rejected for
     ``native`` so stale gateway routing cannot leak into native provider
-    construction.
+    construction. ``stream_usage`` applies only to the gateway; native OpenAI
+    always reports streamed usage.
     """
 
     backend: LLMBackend
@@ -183,6 +198,7 @@ class LLMBackendConfig:
     verify: bool | str | ssl.SSLContext = True
     keepalive_expiry: float = 5.0
     response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
+    stream_usage: bool = True
 
     def __post_init__(self) -> None:
         if self.backend not in ("openai_compatible", "native"):
@@ -203,6 +219,7 @@ class LLMBackendConfig:
             verify=self.verify,
             keepalive_expiry=self.keepalive_expiry,
             response_timeout=self.response_timeout,
+            stream_usage=self.stream_usage,
         )
 
     def native_transport(self) -> NativeTransport:
@@ -313,17 +330,28 @@ def _response_deadline_client_type() -> type[Any]:
     return ResponseDeadlineClient
 
 
+def response_deadline_http_client(*, response_timeout: float, **client_kwargs: Any) -> AsyncHTTPClient:
+    """Return an ``httpx2.AsyncClient`` that bounds each response to ``response_timeout`` seconds.
+
+    The default transports use this client. A custom ``http_client_factory``
+    replaces them, so its clients enforce the response timeout only when they
+    are built here; ``client_kwargs`` reach ``httpx2.AsyncClient`` unchanged.
+    """
+    _validate_response_timeout(response_timeout)
+    client: AsyncHTTPClient = _response_deadline_client_type()(response_timeout=response_timeout, **client_kwargs)
+    return client
+
+
 def _httpx2_client(
     *, verify: bool | str | ssl.SSLContext, keepalive_expiry: float, response_timeout: float
 ) -> AsyncHTTPClient:
     import httpx2
 
-    client: AsyncHTTPClient = _response_deadline_client_type()(
+    return response_deadline_http_client(
         response_timeout=response_timeout,
         verify=verify,
         limits=httpx2.Limits(keepalive_expiry=keepalive_expiry),
     )
-    return client
 
 
 def _default_http_client(endpoint: GatewayEndpoint) -> AsyncHTTPClient:
@@ -345,7 +373,9 @@ def _default_native_http_client(provider: NativeProvider, transport: NativeTrans
 
 # ChatAnthropic falls back to 4,096 output tokens for a model it has no profile
 # for, which a single reasoning turn can exhaust. Every current Claude model
-# accepts at least this many.
+# accepts at least this many; an older Claude model or another model behind an
+# Anthropic-dialect gateway with a smaller limit needs its max_output_tokens
+# catalogued.
 _UNPROFILED_ANTHROPIC_OUTPUT_TOKENS = 64_000
 
 
@@ -355,13 +385,18 @@ def _validate_default_output_tokens(value: int | None) -> None:
 
 
 def _output_tokens(value: int | None, default: int | None, spec: ModelSpec) -> int | None:
-    """Return the per-call output limit, or ``None`` for the model's maximum."""
-    for selected in (value, default, spec.max_output_tokens):
-        if selected is not None:
-            if selected <= 0:
-                raise ModelConfigurationError("max_output_tokens must be positive")
-            return selected
-    return None
+    """Return the per-call output limit, or ``None`` for the model's maximum.
+
+    A per-call limit is used as given. The factory-wide default applies to
+    every model, so it never raises a model above its catalogued maximum.
+    """
+    if value is not None:
+        if value <= 0:
+            raise ModelConfigurationError("max_output_tokens must be positive")
+        return value
+    if default is not None and spec.max_output_tokens is not None:
+        return min(default, spec.max_output_tokens)
+    return default if default is not None else spec.max_output_tokens
 
 
 def _invocation_kwargs(model_id: str, spec: ModelSpec, reasoning_effort: str | None) -> dict[str, Any]:
@@ -437,7 +472,8 @@ def _create_openai_model(
         "api_key": _openai_api_key(api_key),
         "http_async_client": client,
         "streaming": True,
-        "stream_usage": True,
+        # LangChain reports a streamed response's usage only when it is asked for.
+        "stream_usage": endpoint is None or endpoint.stream_usage,
         **kwargs,
     }
     # Without a limit the provider allows the model's maximum.

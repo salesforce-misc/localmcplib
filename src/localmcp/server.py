@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
@@ -261,6 +262,7 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
         "verify",
         "keepalive_expiry",
         "response_timeout",
+        "stream_usage",
         "models",
     }
     unsupported = set(llm) - supported_llm_fields
@@ -290,8 +292,15 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     if isinstance(keepalive_expiry, bool) or not isinstance(keepalive_expiry, int | float):
         raise ConfigError("llm.keepalive_expiry must be a number")
     response_timeout = llm.get("response_timeout", DEFAULT_RESPONSE_TIMEOUT)
-    if isinstance(response_timeout, bool) or not isinstance(response_timeout, int | float) or response_timeout <= 0:
-        raise ConfigError("llm.response_timeout must be a positive number")
+    if (
+        isinstance(response_timeout, bool)
+        or not isinstance(response_timeout, int | float)
+        or not (math.isfinite(response_timeout) and response_timeout > 0)
+    ):
+        raise ConfigError("llm.response_timeout must be a finite positive number")
+    stream_usage = llm.get("stream_usage", True)
+    if not isinstance(stream_usage, bool):
+        raise ConfigError("llm.stream_usage must be a boolean")
     registry = _parse_model_specs(_table(llm.get("models", {}), field="llm.models"))
 
     observability = _table(config.values.get("observability", {}), field="observability")
@@ -310,6 +319,7 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
             verify=verify,
             keepalive_expiry=float(keepalive_expiry),
             response_timeout=float(response_timeout),
+            stream_usage=stream_usage,
         ),
         registry=registry,
         observability=_ObservabilitySettings(log_level=log_level),
