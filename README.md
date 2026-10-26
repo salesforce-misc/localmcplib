@@ -174,8 +174,9 @@ answer = await submit_structured(model, Answer, system_prompt="...", messages=[H
 ```
 
 `localmcp.retry.ModelCallRetryMiddleware` retries a single failed model call
-on rate limits, 5xx responses, and connection faults, so a transient error does
-not restart an agent run or replay its tool calls. It is independent of the
+on rate limits, 5xx responses, and connection faults, including those that
+interrupt a streamed response, so a transient error does not restart an agent
+run or replay its tool calls. It is independent of the
 correction loop: it repeats an identical request after a transport fault and
 never re-prompts, while the correction loop re-prompts after a model's answer
 and never retries transport errors. It also handles both OpenAI and Anthropic

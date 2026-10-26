@@ -74,6 +74,29 @@ stable `ModelFactory.create(model_id, ...)` boundary over both modes. Models
 and transports are created lazily for each call and are closed by the returned
 async context manager.
 
+Every model streams its responses, and LangChain reassembles each into one
+message with its usage and stop reason, so callers see an ordinary response. A
+long generation therefore never waits on one idle read, and the Anthropic SDK
+does not refuse a large output limit for lack of streaming. Without a per-call
+or factory-wide `max_output_tokens`, a model may generate up to its maximum:
+the catalogued `max_output_tokens` when declared, otherwise the provider's own
+limit. Anthropic models, which require an explicit limit, take it from
+`ChatAnthropic`'s model profile, or 64,000 tokens for a model it does not know.
+
+A streamed response is never idle for long: providers send keep-alive events
+while a model thinks, so the SDKs' read timeout, which bounds only the wait
+between bytes, cannot end a stalled one. `[llm].response_timeout` therefore
+bounds each response as a whole, from sending its request to its last streamed
+byte, in seconds (default 600). A response that exceeds it fails with
+`httpx2.ReadTimeout`, which `localmcp.retry` treats as a transient fault, so it
+is retried like any other stalled read. Raise it for models whose single
+responses legitimately take longer.
+
+```toml
+[llm]
+response_timeout = 900
+```
+
 ### Model catalog
 
 The built-in model catalog is advisory. Any model ID is accepted and sent to
@@ -85,7 +108,12 @@ inferred capabilities and log one warning:
 - `claude-*` IDs use the Anthropic dialect and native provider;
 - `gpt-*` and `o<digit>*` IDs use the OpenAI dialect and native provider;
 - all other IDs use the OpenAI dialect and are gateway-only; and
-- OpenAI-dialect models pass a caller-requested reasoning effort through.
+- a caller-requested reasoning effort is passed through.
+
+A reasoning effort reaches OpenAI-dialect models as `reasoning_effort` and
+Anthropic models as `output_config.effort`; both accept the same level names,
+and the provider rejects a level the model lacks. On Anthropic models an effort
+also enables adaptive thinking, so a catalogued zero temperature is omitted.
 
 `[llm.models."<model-id>"]` declares or corrects a model without a library
 release. Each entry updates only the fields it names, starting from the
@@ -100,10 +128,10 @@ dialect = "anthropic"
 ```
 
 Supported fields are `temperature` (`"zero"` or `"omit"`),
-`supports_reasoning_effort`, `default_reasoning_effort`, `native_provider`, and
-`dialect` (`"anthropic"` or `"openai"`). Moving a model to the Anthropic
-dialect disables an inherited reasoning-effort capability unless
-`supports_reasoning_effort` is set explicitly.
+`supports_reasoning_effort`, `default_reasoning_effort`, `native_provider`,
+`dialect` (`"anthropic"` or `"openai"`), and `max_output_tokens` (a positive
+integer: the most the model may generate in one response when a caller sets no
+limit).
 
 Server authors may select a different document at the loading boundary. This
 defines which configuration and secret declarations are visible to that

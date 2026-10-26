@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import re
 import ssl
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property, lru_cache
 from typing import Any, Literal, Protocol
@@ -32,6 +33,8 @@ class ModelSpec:
     independent of the native provider. When it is omitted,
     ``native_provider`` is used, then the OpenAI dialect. A missing
     ``native_provider`` deliberately marks a gateway-only model.
+    ``max_output_tokens`` is the most the model can generate in one response;
+    when it is omitted, the adapter's model profile or the provider decides.
     """
 
     temperature: TemperaturePolicy = "zero"
@@ -39,12 +42,13 @@ class ModelSpec:
     default_reasoning_effort: str | None = None
     native_provider: NativeProvider | None = None
     dialect: ModelDialect | None = None
+    max_output_tokens: int | None = None
 
     def __post_init__(self) -> None:
         if self.default_reasoning_effort is not None and not self.supports_reasoning_effort:
             raise ModelConfigurationError("default_reasoning_effort requires supports_reasoning_effort=True")
-        if self.supports_reasoning_effort and self.adapter_dialect != "openai":
-            raise ModelConfigurationError("reasoning_effort is supported only by the OpenAI dialect")
+        if self.max_output_tokens is not None and self.max_output_tokens <= 0:
+            raise ModelConfigurationError("max_output_tokens must be positive")
 
     @property
     def adapter_dialect(self) -> ModelDialect:
@@ -58,13 +62,12 @@ def infer_model_spec(model_id: str) -> ModelSpec:
     The catalog is advisory: an unregistered ID is passed through to the
     provider, which remains the authority on whether it exists. Temperature is
     omitted because newer models increasingly reject it, and the provider is
-    inferred from well-known ID prefixes. OpenAI-dialect models pass a
-    caller-requested reasoning effort through for the provider to accept or
-    reject.
+    inferred from well-known ID prefixes. A caller-requested reasoning effort
+    is passed through for the provider to accept or reject.
     """
     normalized = model_id.lower()
     if normalized.startswith("claude-"):
-        return ModelSpec(temperature="omit", native_provider="anthropic")
+        return ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="anthropic")
     if normalized.startswith("gpt-") or re.match(r"o\d", normalized):
         return ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="openai")
     return ModelSpec(temperature="omit", supports_reasoning_effort=True)
@@ -105,10 +108,10 @@ class ModelRegistry:
 # behavior; unlisted IDs fall back to infer_model_spec. Invocation policy
 # such as the chosen reasoning effort intentionally remains caller-owned.
 DEFAULT_MODEL_SPECS: Mapping[str, ModelSpec] = {
-    "claude-opus-5": ModelSpec(native_provider="anthropic"),
-    "claude-opus-4-8": ModelSpec(temperature="omit", native_provider="anthropic"),
-    "claude-sonnet-5": ModelSpec(temperature="omit", native_provider="anthropic"),
-    "claude-sonnet-4-6": ModelSpec(native_provider="anthropic"),
+    "claude-opus-5": ModelSpec(supports_reasoning_effort=True, native_provider="anthropic"),
+    "claude-opus-4-8": ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="anthropic"),
+    "claude-sonnet-5": ModelSpec(temperature="omit", supports_reasoning_effort=True, native_provider="anthropic"),
+    "claude-sonnet-4-6": ModelSpec(supports_reasoning_effort=True, native_provider="anthropic"),
     "claude-haiku-4-5-20251001": ModelSpec(native_provider="anthropic"),
     "gpt-5.6": ModelSpec(
         temperature="omit",
@@ -122,6 +125,20 @@ DEFAULT_MODEL_SPECS: Mapping[str, ModelSpec] = {
 DEFAULT_MODEL_REGISTRY = ModelRegistry(DEFAULT_MODEL_SPECS)
 
 
+# Seconds one model response may take, from sending its request to its last
+# streamed byte. Streaming leaves the SDKs' read timeout unable to bound a
+# response: it limits only the wait between bytes, and providers keep sending
+# keep-alive events while a model thinks or stalls.
+DEFAULT_RESPONSE_TIMEOUT = 600.0
+
+
+def _validate_transport(keepalive_expiry: float, response_timeout: float) -> None:
+    if keepalive_expiry < 0:
+        raise ModelConfigurationError("keepalive_expiry must be non-negative")
+    if response_timeout <= 0:
+        raise ModelConfigurationError("response_timeout must be positive")
+
+
 @dataclass(frozen=True)
 class GatewayEndpoint:
     """Shared endpoint and transport settings for a model gateway."""
@@ -130,12 +147,12 @@ class GatewayEndpoint:
     default_headers: Mapping[str, str] | None = None
     verify: bool | str | ssl.SSLContext = True
     keepalive_expiry: float = 5.0
+    response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
 
     def __post_init__(self) -> None:
         if not self.base_url.strip():
             raise ModelConfigurationError("gateway base URL must not be blank")
-        if self.keepalive_expiry < 0:
-            raise ModelConfigurationError("keepalive_expiry must be non-negative")
+        _validate_transport(self.keepalive_expiry, self.response_timeout)
 
 
 @dataclass(frozen=True)
@@ -144,10 +161,10 @@ class NativeTransport:
 
     verify: bool | str | ssl.SSLContext = True
     keepalive_expiry: float = 5.0
+    response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
 
     def __post_init__(self) -> None:
-        if self.keepalive_expiry < 0:
-            raise ModelConfigurationError("keepalive_expiry must be non-negative")
+        _validate_transport(self.keepalive_expiry, self.response_timeout)
 
 
 @dataclass(frozen=True)
@@ -165,6 +182,7 @@ class LLMBackendConfig:
     default_headers: Mapping[str, str] | None = None
     verify: bool | str | ssl.SSLContext = True
     keepalive_expiry: float = 5.0
+    response_timeout: float = DEFAULT_RESPONSE_TIMEOUT
 
     def __post_init__(self) -> None:
         if self.backend not in ("openai_compatible", "native"):
@@ -174,8 +192,7 @@ class LLMBackendConfig:
                 raise ModelConfigurationError("openai_compatible LLM backend requires base_url")
         elif self.base_url is not None:
             raise ModelConfigurationError("native LLM backend does not accept a gateway base_url")
-        if self.keepalive_expiry < 0:
-            raise ModelConfigurationError("keepalive_expiry must be non-negative")
+        _validate_transport(self.keepalive_expiry, self.response_timeout)
 
     def gateway_endpoint(self) -> GatewayEndpoint:
         if self.backend != "openai_compatible" or self.base_url is None:
@@ -185,12 +202,17 @@ class LLMBackendConfig:
             default_headers=self.default_headers,
             verify=self.verify,
             keepalive_expiry=self.keepalive_expiry,
+            response_timeout=self.response_timeout,
         )
 
     def native_transport(self) -> NativeTransport:
         if self.backend != "native":
             raise ModelConfigurationError("native transport requested for a non-native backend")
-        return NativeTransport(verify=self.verify, keepalive_expiry=self.keepalive_expiry)
+        return NativeTransport(
+            verify=self.verify,
+            keepalive_expiry=self.keepalive_expiry,
+            response_timeout=self.response_timeout,
+        )
 
 
 class AsyncHTTPClient(Protocol):
@@ -236,29 +258,110 @@ class ModelFactory(Protocol):
     ) -> OwnedChatModel: ...
 
 
-def _httpx2_client(*, verify: bool | str | ssl.SSLContext, keepalive_expiry: float) -> AsyncHTTPClient:
+@lru_cache(maxsize=1)
+def _response_deadline_client_type() -> type[Any]:
     import httpx2
 
-    return httpx2.AsyncClient(
+    def timeout_error(timeout: float, request: httpx2.Request) -> httpx2.ReadTimeout:
+        # A transport timeout, so callers retry it like any other stalled read.
+        return httpx2.ReadTimeout(f"model response exceeded the {timeout:g} s response timeout", request=request)
+
+    class DeadlineStream(httpx2.AsyncByteStream):
+        """Response body that fails once its response's deadline passes."""
+
+        def __init__(self, stream: Any, *, deadline: float, timeout: float, request: httpx2.Request) -> None:
+            self._stream = stream
+            self._deadline = deadline
+            self._timeout = timeout
+            self._request = request
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            chunks = aiter(self._stream)
+            while True:
+                try:
+                    async with asyncio.timeout_at(self._deadline):
+                        chunk = await anext(chunks)
+                except StopAsyncIteration:
+                    return
+                except TimeoutError:
+                    raise timeout_error(self._timeout, self._request) from None
+                yield chunk
+
+        async def aclose(self) -> None:
+            await self._stream.aclose()
+
+    class ResponseDeadlineClient(httpx2.AsyncClient):
+        """Client bounding each response from request to last byte, however steadily bytes arrive."""
+
+        def __init__(self, *, response_timeout: float, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self._response_timeout = response_timeout
+
+        async def send(self, request: httpx2.Request, *, stream: bool = False, **kwargs: Any) -> httpx2.Response:
+            deadline = asyncio.get_running_loop().time() + self._response_timeout
+            try:
+                async with asyncio.timeout_at(deadline):
+                    response = await super().send(request, stream=stream, **kwargs)
+            except TimeoutError:
+                raise timeout_error(self._response_timeout, request) from None
+            if stream:
+                response.stream = DeadlineStream(
+                    response.stream, deadline=deadline, timeout=self._response_timeout, request=request
+                )
+            return response
+
+    return ResponseDeadlineClient
+
+
+def _httpx2_client(
+    *, verify: bool | str | ssl.SSLContext, keepalive_expiry: float, response_timeout: float
+) -> AsyncHTTPClient:
+    import httpx2
+
+    client: AsyncHTTPClient = _response_deadline_client_type()(
+        response_timeout=response_timeout,
         verify=verify,
         limits=httpx2.Limits(keepalive_expiry=keepalive_expiry),
     )
+    return client
 
 
 def _default_http_client(endpoint: GatewayEndpoint) -> AsyncHTTPClient:
-    return _httpx2_client(verify=endpoint.verify, keepalive_expiry=endpoint.keepalive_expiry)
+    return _httpx2_client(
+        verify=endpoint.verify,
+        keepalive_expiry=endpoint.keepalive_expiry,
+        response_timeout=endpoint.response_timeout,
+    )
 
 
 def _default_native_http_client(provider: NativeProvider, transport: NativeTransport) -> AsyncHTTPClient:
     del provider
-    return _httpx2_client(verify=transport.verify, keepalive_expiry=transport.keepalive_expiry)
+    return _httpx2_client(
+        verify=transport.verify,
+        keepalive_expiry=transport.keepalive_expiry,
+        response_timeout=transport.response_timeout,
+    )
 
 
-def _output_tokens(value: int | None, default: int) -> int:
-    selected = default if value is None else value
-    if selected <= 0:
-        raise ModelConfigurationError("max_output_tokens must be positive")
-    return selected
+# ChatAnthropic falls back to 4,096 output tokens for a model it has no profile
+# for, which a single reasoning turn can exhaust. Every current Claude model
+# accepts at least this many.
+_UNPROFILED_ANTHROPIC_OUTPUT_TOKENS = 64_000
+
+
+def _validate_default_output_tokens(value: int | None) -> None:
+    if value is not None and value <= 0:
+        raise ModelConfigurationError("default_max_output_tokens must be positive")
+
+
+def _output_tokens(value: int | None, default: int | None, spec: ModelSpec) -> int | None:
+    """Return the per-call output limit, or ``None`` for the model's maximum."""
+    for selected in (value, default, spec.max_output_tokens):
+        if selected is not None:
+            if selected <= 0:
+                raise ModelConfigurationError("max_output_tokens must be positive")
+            return selected
+    return None
 
 
 def _invocation_kwargs(model_id: str, spec: ModelSpec, reasoning_effort: str | None) -> dict[str, Any]:
@@ -266,7 +369,9 @@ def _invocation_kwargs(model_id: str, spec: ModelSpec, reasoning_effort: str | N
     if selected_effort is not None and not spec.supports_reasoning_effort:
         raise ModelConfigurationError(f'model "{model_id}" does not support reasoning_effort')
     kwargs: dict[str, Any] = {}
-    if spec.temperature == "zero":
+    # An effort turns on Anthropic thinking, which rejects a temperature.
+    anthropic = "anthropic" in (spec.native_provider, spec.adapter_dialect)
+    if spec.temperature == "zero" and not (anthropic and selected_effort is not None):
         kwargs["temperature"] = 0
     if selected_effort is not None:
         kwargs["reasoning_effort"] = selected_effort
@@ -319,19 +424,25 @@ def _create_openai_model(
     model_id: str,
     api_key: APIKey,
     client: AsyncHTTPClient,
-    max_output_tokens: int,
+    max_output_tokens: int | None,
     kwargs: Mapping[str, Any],
     endpoint: GatewayEndpoint | None,
 ) -> Any:
     from langchain_openai import ChatOpenAI
 
+    # Responses stream so a long generation never waits on one idle read, and
+    # LangChain reassembles them into one message for the caller.
     constructor: dict[str, Any] = {
         "model": model_id,
         "api_key": _openai_api_key(api_key),
         "http_async_client": client,
-        "max_completion_tokens": max_output_tokens,
+        "streaming": True,
+        "stream_usage": True,
         **kwargs,
     }
+    # Without a limit the provider allows the model's maximum.
+    if max_output_tokens is not None:
+        constructor["max_completion_tokens"] = max_output_tokens
     if endpoint is not None:
         constructor.update(base_url=endpoint.base_url, default_headers=dict(endpoint.default_headers or {}))
     return ChatOpenAI(**constructor)
@@ -342,7 +453,7 @@ def _create_anthropic_model(
     model_id: str,
     api_key: APIKey,
     client: AsyncHTTPClient,
-    max_output_tokens: int,
+    max_output_tokens: int | None,
     kwargs: Mapping[str, Any],
     endpoint: GatewayEndpoint | None,
 ) -> Any:
@@ -350,10 +461,13 @@ def _create_anthropic_model(
 
     raw_api_key = _anthropic_api_key(api_key)
     client_kwargs: dict[str, Any] = {"api_key": raw_api_key, "http_client": client}
+    # The Anthropic SDK refuses a non-streaming request whose output limit could
+    # outlast its timeout, so responses stream and LangChain reassembles them.
     model_kwargs: dict[str, Any] = {
         "model": model_id,
         "api_key": raw_api_key,
         "max_tokens": max_output_tokens,
+        "streaming": True,
         **kwargs,
     }
     if endpoint is not None:
@@ -361,7 +475,11 @@ def _create_anthropic_model(
         client_kwargs.update(base_url=endpoint.base_url, default_headers=headers)
         model_kwargs.update(base_url=endpoint.base_url, default_headers=headers)
     async_client = anthropic.AsyncAnthropic(**client_kwargs)
+    # The Messages API requires a limit. Without one, ChatAnthropic uses the
+    # maximum from the model's profile.
     model = _owned_chat_anthropic_type()(**model_kwargs)
+    if max_output_tokens is None and not (model.profile or {}).get("max_output_tokens"):
+        model.max_tokens = _UNPROFILED_ANTHROPIC_OUTPUT_TOKENS
     model._localmcp_async_client = async_client
     return model
 
@@ -381,10 +499,9 @@ class OpenAICompatibleModelFactory:
         api_key: APIKey,
         *,
         http_client_factory: HTTPClientFactory | None = None,
-        default_max_output_tokens: int = 8_000,
+        default_max_output_tokens: int | None = None,
     ) -> None:
-        if default_max_output_tokens <= 0:
-            raise ModelConfigurationError("default_max_output_tokens must be positive")
+        _validate_default_output_tokens(default_max_output_tokens)
         self.registry = registry
         self.endpoint = endpoint
         self.api_key = api_key
@@ -405,7 +522,7 @@ class OpenAICompatibleModelFactory:
     ) -> OwnedChatModel:
         """Create an owned ``ChatOpenAI`` without performing network I/O."""
         spec = self.validate(model_id, reasoning_effort=reasoning_effort)
-        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens)
+        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens, spec)
         kwargs = _invocation_kwargs(model_id, spec, reasoning_effort)
         client = self.http_client_factory(self.endpoint)
         model = _create_openai_model(
@@ -429,10 +546,9 @@ class GatewayModelFactory:
         api_key: APIKey,
         *,
         http_client_factory: HTTPClientFactory | None = None,
-        default_max_output_tokens: int = 8_000,
+        default_max_output_tokens: int | None = None,
     ) -> None:
-        if default_max_output_tokens <= 0:
-            raise ModelConfigurationError("default_max_output_tokens must be positive")
+        _validate_default_output_tokens(default_max_output_tokens)
         self.registry = registry
         self.endpoint = endpoint
         self.api_key = api_key
@@ -452,7 +568,7 @@ class GatewayModelFactory:
         reasoning_effort: str | None = None,
     ) -> OwnedChatModel:
         spec = self.validate(model_id, reasoning_effort=reasoning_effort)
-        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens)
+        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens, spec)
         kwargs = _invocation_kwargs(model_id, spec, reasoning_effort)
         client = self.http_client_factory(self.endpoint)
         if spec.adapter_dialect == "anthropic":
@@ -487,10 +603,9 @@ class NativeModelFactory:
         anthropic_api_key: APIKey | None = None,
         transport: NativeTransport | None = None,
         http_client_factory: NativeHTTPClientFactory | None = None,
-        default_max_output_tokens: int = 8_000,
+        default_max_output_tokens: int | None = None,
     ) -> None:
-        if default_max_output_tokens <= 0:
-            raise ModelConfigurationError("default_max_output_tokens must be positive")
+        _validate_default_output_tokens(default_max_output_tokens)
         self.registry = registry
         self.openai_api_key = openai_api_key
         self.anthropic_api_key = anthropic_api_key
@@ -521,7 +636,7 @@ class NativeModelFactory:
         assert provider is not None
         api_key = self.anthropic_api_key if provider == "anthropic" else self.openai_api_key
         assert api_key is not None
-        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens)
+        output_tokens = _output_tokens(max_output_tokens, self.default_max_output_tokens, spec)
         kwargs = _invocation_kwargs(model_id, spec, reasoning_effort)
         client = self.http_client_factory(provider, self.transport)
         if provider == "anthropic":
@@ -558,7 +673,7 @@ class ConfiguredModelFactory:
         anthropic_api_key: APIKey | None = None,
         gateway_http_client_factory: HTTPClientFactory | None = None,
         native_http_client_factory: NativeHTTPClientFactory | None = None,
-        default_max_output_tokens: int = 8_000,
+        default_max_output_tokens: int | None = None,
     ) -> None:
         self.registry = registry
         self.config = config
