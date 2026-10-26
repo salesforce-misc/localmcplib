@@ -2,7 +2,16 @@
 # `make` with no target prints help.
 
 .DEFAULT_GOAL := help
-.PHONY: help install format format-check lint lint-fix typecheck test test-seatbelt coverage build clean ci
+.PHONY: help install format format-check lint lint-fix typecheck test test-seatbelt test-bubblewrap coverage build clean ci
+
+# Require the host's real sandbox instead of allowing enforcement tests to skip.
+HOST_OS := $(shell uname -s)
+SANDBOX_TEST_ENV :=
+ifeq ($(HOST_OS),Darwin)
+SANDBOX_TEST_ENV := LOCALMCP_REQUIRE_SEATBELT=1
+else ifeq ($(HOST_OS),Linux)
+SANDBOX_TEST_ENV := LOCALMCP_REQUIRE_BUBBLEWRAP=1
+endif
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -26,14 +35,17 @@ lint-fix: ## Lint and apply safe autofixes
 typecheck: ## Type-check the package with mypy
 	uv run mypy src
 
-test: ## Run the test suite
-	uv run pytest
+test: ## Run the test suite, requiring the native OS sandbox
+	$(SANDBOX_TEST_ENV) uv run pytest
 
 test-seatbelt: ## Run real Seatbelt enforcement tests (macOS only; fails instead of skipping)
 	LOCALMCP_REQUIRE_SEATBELT=1 uv run pytest -m seatbelt -v
 
-coverage: ## Run tests with coverage and write coverage.xml
-	uv run pytest --cov=localmcp --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=90
+test-bubblewrap: ## Run real bubblewrap enforcement tests (Linux only; fails instead of skipping)
+	LOCALMCP_REQUIRE_BUBBLEWRAP=1 uv run pytest -m bubblewrap -v
+
+coverage: ## Run tests with the native OS sandbox, coverage, and coverage.xml
+	$(SANDBOX_TEST_ENV) uv run pytest --cov=localmcp --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=90
 
 build: ## Build the sdist and wheel into dist/
 	uv build

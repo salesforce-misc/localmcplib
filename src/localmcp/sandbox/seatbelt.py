@@ -8,46 +8,61 @@ import json
 import os
 import resource
 import signal
-import stat
 import subprocess
 import tempfile
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Protocol
 
 from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
 
 from localmcp.sandbox.base import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MAX_OUTPUT_BYTES,
-    INSPECTION_TOOLS,
     MAX_ADDITIONAL_PROCESSES,
-    MAX_COMMAND_CHARACTERS,
     MAX_OPEN_FILES,
     CommandResult,
     RootAccess,
     SandboxError,
     SandboxProfile,
-    SandboxRoot,
 )
-
-DEFAULT_EXHAUSTED_MESSAGE = "Source-tool budget exhausted. Produce the final structured response now."
-
-
-def _tool_description(tools: tuple[str, ...]) -> str:
-    commands = "Only shell builtins can run."
-    if tools:
-        commands = f"Besides shell builtins, only these commands can run: {', '.join(tools)}."
-    return (
-        f"Run a command in the policy-bound filesystem roots. {commands} "
-        "No credentials or caller environment are inherited."
-    )
-
-
-DEFAULT_TOOL_DESCRIPTION = _tool_description(INSPECTION_TOOLS)
+from localmcp.sandbox.base import (
+    INSPECTION_TOOLS as INSPECTION_TOOLS,
+)
+from localmcp.sandbox.base import (
+    MAX_COMMAND_CHARACTERS as MAX_COMMAND_CHARACTERS,
+)
+from localmcp.sandbox.base import (
+    SandboxRoot as SandboxRoot,
+)
+from localmcp.sandbox.policy import (
+    _check_denied_paths,
+    _check_scratch,
+    _path_ancestors,
+    _protected_roots,
+    _validated_roots,
+)
+from localmcp.sandbox.runtime import (
+    CommandRuntime,
+    _OutputLimitExceeded,
+    command_environment,
+    validate_command,
+    validate_limits,
+)
+from localmcp.sandbox.tools import (
+    DEFAULT_EXHAUSTED_MESSAGE,
+    ToolCallBudget,
+    _sandbox_tools,
+)
+from localmcp.sandbox.tools import (
+    DEFAULT_TOOL_DESCRIPTION as DEFAULT_TOOL_DESCRIPTION,
+)
+from localmcp.sandbox.tools import (
+    BashInput as BashInput,
+)
+from localmcp.sandbox.tools import (
+    _tool_description as _tool_description,
+)
 
 _BASE_PROFILE = """\
 (version 1)
@@ -68,47 +83,6 @@ _NETWORK_PROFILE = """\
 (allow file-read* (literal "/private/etc/ssl/openssl.cnf") (literal "/private/etc/ssl/cert.pem"))
 """
 _SHARED_MEMORY_IPC_PROFILE = "(allow ipc-posix-shm ipc-sysv-shm)\n"
-
-
-def _validated_roots(roots: tuple[SandboxRoot, ...]) -> tuple[SandboxRoot, ...]:
-    resolved: list[SandboxRoot] = []
-    by_path: dict[Path, RootAccess] = {}
-    for root in roots:
-        try:
-            path = root.path.resolve(strict=True)
-        except OSError as exc:
-            raise SandboxError(f"sandbox root does not exist: {root.path}") from exc
-        if not path.is_dir():
-            raise SandboxError(f"sandbox root is not a directory: {root.path}")
-        previous = by_path.get(path)
-        if previous is not None:
-            if previous != root.access:
-                raise SandboxError(f"sandbox root has conflicting access grants: {path}")
-            continue
-        by_path[path] = root.access
-        resolved.append(SandboxRoot(path, root.access))
-
-    # A read-only root inside a read-write root is write-protected there; a read-write
-    # root inside that protected tree could not be granted, and normalizing below would
-    # silently fold it into the outer read-write root.
-    for protected in _protected_roots(tuple(resolved)):
-        for root in resolved:
-            if root.access == RootAccess.READ_WRITE and root.path.is_relative_to(protected):
-                raise SandboxError(f"read-write root is inside a write-protected read-only root: {root.path}")
-
-    normalized: list[SandboxRoot] = []
-    for index, root in enumerate(resolved):
-        if index != 0 and any(
-            root.access == existing.access and root.path.is_relative_to(existing.path) for existing in normalized
-        ):
-            continue
-        normalized = [
-            existing
-            for existing_index, existing in enumerate(normalized)
-            if existing_index == 0 or existing.access != root.access or not existing.path.is_relative_to(root.path)
-        ]
-        normalized.append(root)
-    return tuple(normalized)
 
 
 # Xcode records license acceptance here; the /usr/bin shims refuse to run without reading it.
@@ -429,65 +403,6 @@ def _tool_grants(tools: tuple[str, ...], optional_tools: tuple[str, ...] = ()) -
     )
 
 
-def _check_denied_paths(denied_paths: tuple[Path, ...], kind: str = "denied path") -> None:
-    """Fail unless Seatbelt can deny access to each path's files under every name.
-
-    Seatbelt denies the real path a file is opened by. A denied path through a symlink
-    denies nothing, and a denied file with another hard link stays accessible under that
-    name. ``kind`` names the paths in errors: denied paths are hidden, and write-protected
-    read-only roots are checked the same way.
-    """
-
-    def uncheckable(error: OSError) -> None:
-        # A file that is gone has no other name.
-        if not isinstance(error, FileNotFoundError):
-            raise SandboxError(f"sandbox {kind} cannot be checked for hard links: {error.filename}") from error
-
-    for denied in denied_paths:
-        if Path(os.path.realpath(denied)) != denied:
-            raise SandboxError(f"sandbox {kind} goes through a symlink and cannot be enforced: {denied}")
-        names = [denied]
-        if denied.is_dir():
-            names.extend(
-                Path(directory, name) for directory, _, files in os.walk(denied, onerror=uncheckable) for name in files
-            )
-        for name in names:
-            try:
-                status = name.lstat()
-            except OSError as exc:
-                uncheckable(exc)
-                continue
-            if not stat.S_ISDIR(status.st_mode) and status.st_nlink > 1:
-                raise SandboxError(f"sandbox {kind} has another hard link and cannot be enforced: {name}")
-
-
-def _protected_roots(roots: tuple[SandboxRoot, ...]) -> tuple[Path, ...]:
-    """Return the read-only roots that lie inside a read-write root, which must be write-protected."""
-    return tuple(
-        root.path
-        for root in roots
-        if root.access == RootAccess.READ_ONLY
-        and any(other.access == RootAccess.READ_WRITE and root.path.is_relative_to(other.path) for other in roots)
-    )
-
-
-def _check_scratch(scratch: Path, roots: tuple[SandboxRoot, ...]) -> None:
-    """Fail unless ``scratch`` is a real path outside every root, and so outside every denied path.
-
-    Cleanup finds a command's processes by their access to its scratch, so no other rule may
-    grant or deny it.
-    """
-    if Path(os.path.realpath(scratch)) != scratch or any(scratch.is_relative_to(root.path) for root in roots):
-        raise SandboxError(f"sandbox temporary directory must be a real path outside its roots: {scratch}")
-
-
-def _path_ancestors(paths: tuple[Path, ...]) -> tuple[Path, ...]:
-    ancestors: set[Path] = set()
-    for path in paths:
-        ancestors.update(parent for parent in path.parents if parent != Path(path.anchor))
-    return tuple(sorted(ancestors, key=os.fspath))
-
-
 # Each command's TMPDIR holds this file, which only that command's policy denies; see _runs_under.
 _SCRATCH_SENTINEL = ".localmcp-sentinel"
 _SANDBOX_FILTER_NONE = 0
@@ -590,11 +505,7 @@ def _owned_process_limit() -> int | None:
     return proposed if proposed > owned else None
 
 
-class _OutputLimitExceeded(Exception):
-    pass
-
-
-class MacOSSandbox:
+class MacOSSandbox(CommandRuntime):
     """Run a command with no caller environment under immutable Seatbelt authority.
 
     ``tools`` names the profile's tools that commands can run.
@@ -608,12 +519,7 @@ class MacOSSandbox:
         max_output_bytes: int = DEFAULT_MAX_OUTPUT_BYTES,
         process_label: str = "localmcp-workspace-sandbox",
     ):
-        if timeout_seconds <= 0:
-            raise SandboxError("sandbox timeout must be positive")
-        if max_output_bytes <= 0:
-            raise SandboxError("sandbox output limit must be positive")
-        if not process_label or "\0" in process_label:
-            raise SandboxError("sandbox process label must not be blank or contain NUL bytes")
+        validate_limits(timeout_seconds, max_output_bytes, process_label)
         self.roots = _validated_roots(profile.roots)
         self.root = self.roots[0].path
         denied_paths: list[Path] = []
@@ -672,10 +578,7 @@ class MacOSSandbox:
         )
 
     async def run(self, command: str) -> CommandResult:
-        if not command.strip():
-            raise SandboxError("command must not be blank")
-        if "\0" in command or len(command) > MAX_COMMAND_CHARACTERS:
-            raise SandboxError(f"command must contain at most {MAX_COMMAND_CHARACTERS} characters and no NUL bytes")
+        validate_command(command)
         limits = [
             f"ulimit -t {max(1, int(self.timeout_seconds))}",
             f"ulimit -n {MAX_OPEN_FILES}",
@@ -856,62 +759,12 @@ class MacOSSandbox:
         return runtime_profile
 
     def _environment(self, scratch: Path) -> dict[str, str]:
-        paths = [*map(os.fspath, self._toolchain_bin_directories), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
         environment: dict[str, str] = {}
         if self._developer is not None:
-            # Pin the selection the grant was computed for, and keep libxcrun's lookup cache
-            # out of the per-user temporary directory, which the sandbox cannot write.
+            # Pin the selected install and keep shim caches in this invocation's scratch.
             environment["DEVELOPER_DIR"] = os.fspath(self._developer)
             environment["xcrun_db"] = os.fspath(scratch / "xcrun_db")
-        return environment | {
-            "HOME": "/var/empty",
-            "PATH": os.pathsep.join(paths),
-            "LC_ALL": "C",
-            "RIPGREP_CONFIG_PATH": "",
-            "TMPDIR": os.fspath(scratch),
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            # Apple's git ignores GIT_CONFIG_SYSTEM for its bundled share/git-core/gitconfig
-            # (full of osxkeychain helpers); NOSYSTEM neutralizes it and keeps git hermetic.
-            "GIT_CONFIG_NOSYSTEM": "1",
-            # Likewise skip the bundled share/git-core/gitattributes the sandbox can't read.
-            "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-
-    async def _read_output(
-        self,
-        process: asyncio.subprocess.Process,
-        stdout: bytearray,
-        stderr: bytearray,
-    ) -> None:
-        total = 0
-        lock = asyncio.Lock()
-
-        async def read(stream: asyncio.StreamReader | None, destination: bytearray) -> None:
-            nonlocal total
-            if stream is None:
-                return
-            while chunk := await stream.read(64 * 1024):
-                async with lock:
-                    remaining = self.max_output_bytes - total
-                    if remaining <= 0:
-                        raise _OutputLimitExceeded
-                    destination.extend(chunk[:remaining])
-                    total += min(len(chunk), remaining)
-                    if len(chunk) > remaining:
-                        raise _OutputLimitExceeded
-
-        readers = [asyncio.create_task(read(process.stdout, stdout)), asyncio.create_task(read(process.stderr, stderr))]
-        try:
-            await asyncio.gather(*readers)
-            await process.wait()
-        except BaseException:
-            for task in readers:
-                task.cancel()
-            await asyncio.gather(*readers, return_exceptions=True)
-            raise
+        return command_environment(scratch, bin_directories=self._toolchain_bin_directories, extra=environment)
 
     @staticmethod
     async def _kill(process: asyncio.subprocess.Process, scratch: Path) -> None:
@@ -923,21 +776,6 @@ class MacOSSandbox:
         # Detached descendants can hold the output pipes open; draining would wait for them.
         _terminate_command_processes(scratch)
         await process.communicate()
-
-    @staticmethod
-    def _append_error(stderr: bytearray, message: str) -> str:
-        rendered = stderr.decode(errors="replace").rstrip()
-        return f"{rendered}\n{message}".lstrip()
-
-
-class BashInput(BaseModel):
-    command: str = Field(min_length=1, max_length=MAX_COMMAND_CHARACTERS)
-
-
-class ToolCallBudget(Protocol):
-    async def claim(self) -> tuple[bool, str | None]: ...
-
-    def metadata(self, exhausted_scope: str | None = None) -> dict[str, object]: ...
 
 
 def sandbox_tools(
@@ -960,27 +798,10 @@ def sandbox_tools(
         max_output_bytes=max_output_bytes,
         process_label=process_label,
     )
-    if description is None:
-        description = _tool_description(sandbox.tools)
-
-    async def invoke(name: str, operation: Callable[[], Awaitable[BaseModel]]) -> dict[str, Any]:
-        allowed, exhausted_scope = await budget.claim()
-        if not allowed:
-            return {"error": exhausted_message, "tool_budget": budget.metadata(exhausted_scope)}
-        try:
-            result = await operation()
-            return {"result": result.model_dump(), "tool_budget": budget.metadata()}
-        except Exception as exc:
-            return {"error": f"{name} failed with {type(exc).__name__}: {exc}", "tool_budget": budget.metadata()}
-
-    async def bash(command: str) -> dict[str, Any]:
-        return await invoke("Bash", lambda: sandbox.run(command))
-
-    return [
-        StructuredTool.from_function(
-            coroutine=bash,
-            name="Bash",
-            description=description,
-            args_schema=BashInput,
-        )
-    ]
+    return _sandbox_tools(
+        sandbox,
+        granted_tools=sandbox.tools,
+        budget=budget,
+        exhausted_message=exhausted_message,
+        description=description,
+    )
