@@ -6,11 +6,12 @@ import asyncio
 import random
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
 import anthropic
+import httpx2
 import openai
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 
@@ -34,28 +35,67 @@ _RESET_AT_PATTERN = re.compile(r"limit resets at:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{
 # window exceeds, independently of the caller's max_delay.
 _MAX_RESET_DELAY_SECONDS = 120.0
 
+# A failure after a streamed response has begun arrives as an error event under
+# the original 200 status, so its provider error type or gateway code, not the
+# status, says whether it is transient. Anthropic sends {"type": "error",
+# "error": {"type": ...}}; OpenAI-dialect gateways send the error object itself.
+_RATE_LIMIT_STREAM_ERRORS = frozenset({"rate_limit_error", "rate_limit_exceeded", "429"})
+_TRANSIENT_STREAM_ERRORS = frozenset({"api_error", "overloaded_error", "server_error"})
+
+# A connection that drops or stalls mid-stream raises the transport error
+# directly; the SDKs wrap only failures before the response starts.
+_TRANSIENT_STREAM_FAULTS = (httpx2.NetworkError, httpx2.RemoteProtocolError, httpx2.TimeoutException)
+
+
+def _stream_error_kinds(exc: BaseException) -> set[str]:
+    """Return the error type and code of a provider error delivered mid-stream."""
+    if not isinstance(exc, (anthropic.APIError, openai.APIError)):
+        return set()
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status >= 400:
+        return set()
+    body = getattr(exc, "body", None)
+    if not isinstance(body, Mapping):
+        return set()
+    error = body.get("error", body)
+    if not isinstance(error, Mapping):
+        return set()
+    return {str(error[key]) for key in ("type", "code") if error.get(key) is not None}
+
+
+def _is_server_error_code(kind: str) -> bool:
+    # An HTTP status code. str.isdigit() alone also accepts digits such as "²",
+    # which int() rejects.
+    return len(kind) == 3 and kind.isascii() and kind.isdigit() and int(kind) >= 500
+
 
 def is_rate_limit_error(exc: BaseException) -> bool:
     """Return True when ``exc`` is a provider or gateway 429 rejection."""
     if isinstance(exc, (anthropic.RateLimitError, openai.RateLimitError)):
         return True
-    return getattr(exc, "status_code", None) == _RATE_LIMIT_STATUS
+    if getattr(exc, "status_code", None) == _RATE_LIMIT_STATUS:
+        return True
+    return bool(_stream_error_kinds(exc) & _RATE_LIMIT_STREAM_ERRORS)
 
 
 def is_retryable_error(exc: BaseException) -> bool:
     """Return True for transient model errors worth retrying with backoff.
 
-    Covers rate limits, 5xx responses, and connection or timeout faults.
-    Deterministic failures such as validation errors or unknown models are
-    excluded so a retry never hides them behind repeated attempts.
+    Covers rate limits, 5xx responses, connection or timeout faults, and the
+    same failures when they interrupt a streamed response. Deterministic
+    failures such as validation errors or unknown models are excluded so a
+    retry never hides them behind repeated attempts.
     """
     if is_rate_limit_error(exc):
         return True
     status = getattr(exc, "status_code", None)
     if isinstance(status, int) and status >= 500:
         return True
+    kinds = _stream_error_kinds(exc)
+    if kinds & _TRANSIENT_STREAM_ERRORS or any(_is_server_error_code(kind) for kind in kinds):
+        return True
     # Each SDK's timeout error subclasses its connection error.
-    return isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError))
+    return isinstance(exc, (anthropic.APIConnectionError, openai.APIConnectionError, *_TRANSIENT_STREAM_FAULTS))
 
 
 def _retry_after_seconds(exc: BaseException) -> float | None:

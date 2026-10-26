@@ -15,6 +15,7 @@ from fastmcp import FastMCP
 from localmcp.config import ConfigDocument, ConfigError, LocalMCPPaths, ServerConfig
 from localmcp.llm import (
     DEFAULT_MODEL_REGISTRY,
+    DEFAULT_RESPONSE_TIMEOUT,
     ConfiguredModelFactory,
     LLMBackend,
     LLMBackendConfig,
@@ -253,7 +254,16 @@ def main[ConfigT, RuntimeT: RuntimeLifecycle](server: STDIOServer[ConfigT, Runti
 
 def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     llm = _table(config.values.get("llm"), field="llm")
-    supported_llm_fields = {"backend", "base_url", "default_headers", "verify", "keepalive_expiry", "models"}
+    supported_llm_fields = {
+        "backend",
+        "base_url",
+        "default_headers",
+        "verify",
+        "keepalive_expiry",
+        "response_timeout",
+        "stream_usage",
+        "models",
+    }
     unsupported = set(llm) - supported_llm_fields
     if unsupported:
         raise ConfigError(f"llm has unsupported fields: {', '.join(sorted(unsupported))}")
@@ -280,6 +290,12 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     keepalive_expiry = llm.get("keepalive_expiry", 5.0)
     if isinstance(keepalive_expiry, bool) or not isinstance(keepalive_expiry, int | float):
         raise ConfigError("llm.keepalive_expiry must be a number")
+    response_timeout = llm.get("response_timeout", DEFAULT_RESPONSE_TIMEOUT)
+    if isinstance(response_timeout, bool) or not isinstance(response_timeout, int | float):
+        raise ConfigError("llm.response_timeout must be a number")
+    stream_usage = llm.get("stream_usage", True)
+    if not isinstance(stream_usage, bool):
+        raise ConfigError("llm.stream_usage must be a boolean")
     registry = _parse_model_specs(_table(llm.get("models", {}), field="llm.models"))
 
     observability = _table(config.values.get("observability", {}), field="observability")
@@ -290,14 +306,22 @@ def _parse_shared_config(config: ServerConfig) -> _ServerSettings:
     if not isinstance(log_level, str):
         raise ConfigError("observability.log_level must be a string")
 
-    return _ServerSettings(
-        llm=LLMBackendConfig(
+    # The backend config owns the value rules, such as a finite positive
+    # response timeout or a gateway base_url.
+    try:
+        backend_config = LLMBackendConfig(
             backend=selected_backend,
             base_url=base_url,
             default_headers=headers,
             verify=verify,
             keepalive_expiry=float(keepalive_expiry),
-        ),
+            response_timeout=float(response_timeout),
+            stream_usage=stream_usage,
+        )
+    except ModelConfigurationError as exc:
+        raise ConfigError(f"llm: {exc}") from exc
+    return _ServerSettings(
+        llm=backend_config,
         registry=registry,
         observability=_ObservabilitySettings(log_level=log_level),
     )
@@ -321,7 +345,12 @@ def _parse_model_specs(models: Mapping[str, object]) -> ModelRegistry:
     for model_id, raw in models.items():
         field = f"llm.models.{model_id}"
         entry = _table(raw, field=field)
-        unsupported = set(entry) - {*_MODEL_SPEC_CHOICES, "supports_reasoning_effort", "default_reasoning_effort"}
+        unsupported = set(entry) - {
+            *_MODEL_SPEC_CHOICES,
+            "supports_reasoning_effort",
+            "default_reasoning_effort",
+            "max_output_tokens",
+        }
         if unsupported:
             raise ConfigError(f"{field} has unsupported fields: {', '.join(sorted(unsupported))}")
         updates: dict[str, Any] = {}
@@ -339,16 +368,12 @@ def _parse_model_specs(models: Mapping[str, object]) -> ModelRegistry:
             if not isinstance(entry["default_reasoning_effort"], str):
                 raise ConfigError(f"{field}.default_reasoning_effort must be a string")
             updates["default_reasoning_effort"] = entry["default_reasoning_effort"]
+        if "max_output_tokens" in entry:
+            value = entry["max_output_tokens"]
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ConfigError(f"{field}.max_output_tokens must be an integer")
+            updates["max_output_tokens"] = value
         base = catalog.get(model_id) or infer_model_spec(model_id)
-        if "supports_reasoning_effort" not in updates and ("dialect" in updates or "native_provider" in updates):
-            # A dialect change can invalidate an inherited reasoning capability;
-            # only an explicit setting keeps it.
-            dialect = (
-                updates.get("dialect", base.dialect) or updates.get("native_provider", base.native_provider) or "openai"
-            )
-            if dialect != "openai":
-                updates.setdefault("supports_reasoning_effort", False)
-                updates.setdefault("default_reasoning_effort", None)
         try:
             overrides[model_id] = replace(base, **updates)
         except ModelConfigurationError as exc:
