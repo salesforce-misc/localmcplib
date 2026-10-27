@@ -5,7 +5,6 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Sequence
 from typing import Annotated, Any, NotRequired
 
-from langchain.agents import create_agent
 from langchain.agents.middleware import AgentMiddleware, AgentState, ModelRequest, ModelResponse, hook_config
 from langchain.agents.middleware.types import PrivateStateAttr
 from langchain.agents.structured_output import StructuredOutputError
@@ -17,6 +16,7 @@ from langchain_core.tools import BaseTool, StructuredTool
 from langgraph.runtime import Runtime
 from pydantic import BaseModel, ValidationError
 
+from localmcp.agents import create_agent
 from localmcp.retry import ModelCallRetryMiddleware
 
 
@@ -236,7 +236,8 @@ async def submit_structured[SchemaT: BaseModel](
         model,
         [],
         system_prompt=system_prompt,
-        middleware=[SubmitResultMiddleware(schema, max_attempts=max_attempts), retry or ModelCallRetryMiddleware()],
+        middleware=[SubmitResultMiddleware(schema, max_attempts=max_attempts)],
+        retry=retry,
     )
     result: dict[str, Any] = await agent.ainvoke({"messages": list(messages)}, config=config)
     return schema.model_validate(result["structured_response"])

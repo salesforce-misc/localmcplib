@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 
 __all__ = ["STDIOServer", "main"]
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 
 def __getattr__(name: str) -> Any:

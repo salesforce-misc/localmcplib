@@ -173,10 +173,13 @@ replaces `with_structured_output`, whose `function_calling` method forces
 answer = await submit_structured(model, Answer, system_prompt="...", messages=[HumanMessage("...")])
 ```
 
-`localmcp.retry.ModelCallRetryMiddleware` retries a single failed model call
-on rate limits, 5xx responses, and connection faults, including those that
-interrupt a streamed response, so a transient error does not restart an agent
-run or replay its tool calls. It is independent of the
+`localmcp.agents.create_agent` is LangChain's `create_agent` with
+`localmcp.retry.ModelCallRetryMiddleware` placed after the given middleware, so
+it wraps each model call directly. The middleware retries a single failed model
+call on rate limits, 5xx responses, and connection or timeout faults, including
+those that interrupt a streamed response, so a transient error or a response
+that outlasts its deadline does not restart an agent run or replay its tool
+calls. It is independent of the
 correction loop: it repeats an identical request after a transport fault and
 never re-prompts, while the correction loop re-prompts after a model's answer
 and never retries transport errors. It also handles both OpenAI and Anthropic
@@ -184,11 +187,18 @@ SDK errors and gateway-specific rate-limit messages, so one policy applies
 whichever model and route an application is configured with. Rate limits wait for
 `Retry-After` or for a reset instant embedded in the error message; other
 errors use capped, jittered exponential backoff. Deterministic errors propagate
-immediately. `submit_structured` includes it by default. Place it after
-`SubmitResultMiddleware` so it wraps the model call directly:
+immediately. `submit_structured` builds its agent the same way. Pass `retry` to
+change the policy, or `ModelCallRetryMiddleware(max_attempts=1)` to disable it:
 
 ```python
-middleware = [SubmitResultMiddleware(Answer), ModelCallRetryMiddleware(max_attempts=3)]
+from localmcp.agents import create_agent
+
+agent = create_agent(
+    model,
+    tools,
+    middleware=[SubmitResultMiddleware(Answer)],
+    retry=ModelCallRetryMiddleware(max_attempts=5, on_retry=log_retry),
+)
 ```
 
 `call_with_rate_limit_retry`, `is_retryable_error`, and `rate_limit_delay`
