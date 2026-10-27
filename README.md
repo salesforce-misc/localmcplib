@@ -282,7 +282,8 @@ grants, and tools installed elsewhere, such as under `~/.cargo/bin`, are not
 available. Configuration a tool reads from outside its own install, such as
 Homebrew OpenSSL's `etc/openssl@3`, is not granted either. The exception is a
 profile with `network`, which also grants the system TLS configuration and
-trust store in `/etc/ssl`, without which the system `curl` cannot start.
+trust store in `/etc/ssl`, without which the system `curl` cannot start. Where
+either is a symlink, the file it resolves to is granted as well.
 
 ### Durable workflows
 

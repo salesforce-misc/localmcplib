@@ -62,11 +62,9 @@ _BASE_PROFILE = """\
     (subpath "/Library/Apple")
     (subpath "/private/var/select"))
 """
+_NETWORK_PROFILE = "(allow network-outbound)\n"
 # The system TLS library, which curl uses, needs its configuration and trust store to start.
-_NETWORK_PROFILE = """\
-(allow network-outbound)
-(allow file-read* (literal "/private/etc/ssl/openssl.cnf") (literal "/private/etc/ssl/cert.pem"))
-"""
+_TLS_FILES = (Path("/private/etc/ssl/openssl.cnf"), Path("/private/etc/ssl/cert.pem"))
 _SHARED_MEMORY_IPC_PROFILE = "(allow ipc-posix-shm ipc-sysv-shm)\n"
 
 
@@ -109,6 +107,15 @@ def _validated_roots(roots: tuple[SandboxRoot, ...]) -> tuple[SandboxRoot, ...]:
         ]
         normalized.append(root)
     return tuple(normalized)
+
+
+def _tls_files() -> tuple[Path, ...]:
+    """Return the system TLS files and the target of each one that is a symlink.
+
+    Seatbelt checks the real path a file is opened by, so a host that replaces its
+    trust store with a symlink needs the target granted as well.
+    """
+    return tuple(dict.fromkeys(path for file in _TLS_FILES for path in (file, Path(os.path.realpath(file)))))
 
 
 # Xcode records license acceptance here; the /usr/bin shims refuse to run without reading it.
@@ -652,6 +659,7 @@ class MacOSSandbox:
         self._executables = tuple(dict.fromkeys((*_shell_executables(), *grants.executables)))
         self._executable_trees = grants.executable_trees
         self._interpreters = grants.interpreters
+        self._tls_files = _tls_files() if self.profile.network else ()
         # Each command gets a fresh temporary directory in here; see _execute.
         self._scratch_parent = Path(tempfile.gettempdir()).resolve()
         _check_scratch(self._scratch_parent, self.roots)
@@ -722,6 +730,7 @@ class MacOSSandbox:
             ("EXECUTABLE", self._executables),
             ("EXECUTABLE_TREE", self._executable_trees),
             ("INTERPRETER", self._interpreters),
+            ("TLS_FILE", self._tls_files),
             ("METADATA_ANCESTOR", self._metadata_ancestors),
         ):
             runtime_definitions.extend(
@@ -805,6 +814,9 @@ class MacOSSandbox:
         runtime_profile += f'(allow {scratch_access} (subpath (param "SCRATCH")))\n'
         if self.profile.network:
             runtime_profile += _NETWORK_PROFILE
+            runtime_profile += "".join(
+                f'(allow file-read* (literal (param "TLS_FILE_{index}")))\n' for index in range(len(self._tls_files))
+            )
         if self.profile.ipc:
             runtime_profile += _SHARED_MEMORY_IPC_PROFILE
         # Toolchain trees hold the binaries and dylibs tools run and load, so they need
