@@ -24,12 +24,17 @@ def create_agent(
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Return LangChain's ``create_agent`` with each model call retried on transient errors.
 
-    Every response is streamed and bounded by a deadline, so a stalled or
-    dropped stream fails one model call. ``retry``, a default
-    :class:`~localmcp.retry.ModelCallRetryMiddleware` when omitted, is placed
-    after ``middleware`` so it wraps the model call directly: only the failed
-    request is repeated, and completed turns and tool calls are kept. Pass
-    ``ModelCallRetryMiddleware(max_attempts=1)`` to disable retries. Other
-    arguments are passed to LangChain's ``create_agent`` unchanged.
+    ``retry``, a default :class:`~localmcp.retry.ModelCallRetryMiddleware`
+    when omitted, is placed after ``middleware`` so it wraps the model call
+    directly: only the failed request is repeated, and completed turns and tool
+    calls are kept. Pass ``ModelCallRetryMiddleware(max_attempts=1)`` to
+    disable retries; listing one in ``middleware`` raises :class:`ValueError`.
+    ``model`` is used as given. The models :mod:`localmcp.llm`'s factories
+    build with their default transports stream every response under a
+    deadline, so a stalled or dropped stream fails one model call; other models
+    do only if they are configured likewise. Other arguments are passed to
+    LangChain's ``create_agent`` unchanged.
     """
+    if any(isinstance(item, ModelCallRetryMiddleware) for item in middleware):
+        raise ValueError("ModelCallRetryMiddleware must not be listed in middleware; pass it as retry instead")
     return _create_agent(model, tools, middleware=[*middleware, retry or ModelCallRetryMiddleware()], **kwargs)

@@ -479,3 +479,10 @@ async def test_an_agent_uses_the_retry_policy_it_is_given(sleeps: list[float]) -
         await agent.ainvoke({"messages": [HumanMessage(content="Capital of France?")]})
     assert len(model.requests) == 1
     assert sleeps == []
+
+
+def test_a_retry_policy_listed_as_middleware_is_rejected() -> None:
+    model = _ScriptedChatModel(responses=[])
+
+    with pytest.raises(ValueError, match="pass it as retry"):
+        create_agent(model, [], middleware=[ModelCallRetryMiddleware(max_attempts=3)])

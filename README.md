@@ -177,9 +177,11 @@ answer = await submit_structured(model, Answer, system_prompt="...", messages=[H
 `localmcp.retry.ModelCallRetryMiddleware` placed after the given middleware, so
 it wraps each model call directly. The middleware retries a single failed model
 call on rate limits, 5xx responses, and connection or timeout faults, including
-those that interrupt a streamed response, so a transient error or a response
-that outlasts its deadline does not restart an agent run or replay its tool
-calls. It is independent of the
+those that interrupt a streamed response, so a transient error does not restart
+an agent run or replay its tool calls. Models built by `localmcp.llm`'s
+factories with their default transports stream every response under a
+deadline, so a response that outlasts it fails as a timeout and is retried the
+same way; a model built elsewhere is used as given. It is independent of the
 correction loop: it repeats an identical request after a transport fault and
 never re-prompts, while the correction loop re-prompts after a model's answer
 and never retries transport errors. It also handles both OpenAI and Anthropic
@@ -188,7 +190,9 @@ whichever model and route an application is configured with. Rate limits wait fo
 `Retry-After` or for a reset instant embedded in the error message; other
 errors use capped, jittered exponential backoff. Deterministic errors propagate
 immediately. `submit_structured` builds its agent the same way. Pass `retry` to
-change the policy, or `ModelCallRetryMiddleware(max_attempts=1)` to disable it:
+change the policy, or `ModelCallRetryMiddleware(max_attempts=1)` to disable it.
+Listing `ModelCallRetryMiddleware` in `middleware` raises `ValueError`, so code
+that added it there passes it as `retry` instead:
 
 ```python
 from localmcp.agents import create_agent

@@ -198,7 +198,8 @@ def test_network_grants_the_target_of_a_symlinked_tls_file(monkeypatch: pytest.M
     root.mkdir()
     config = tmp_path / "openssl.cnf"
     config.touch()
-    bundle = tmp_path / "bundle.pem"
+    bundle = tmp_path / "store" / "bundle.pem"
+    bundle.parent.mkdir()
     bundle.touch()
     trust_store = tmp_path / "cert.pem"
     trust_store.symlink_to(bundle)
@@ -209,8 +210,10 @@ def test_network_grants_the_target_of_a_symlinked_tls_file(monkeypatch: pytest.M
 
     assert online._tls_files == (config, trust_store, bundle.resolve())
     assert '(allow file-read* (literal (param "TLS_FILE_2")))' in online._compiled_profile().splitlines()
+    assert bundle.parent.resolve() in online._metadata_ancestors
     assert offline._tls_files == ()
     assert "TLS_FILE" not in offline._compiled_profile()
+    assert bundle.parent.resolve() not in offline._metadata_ancestors
 
 
 def test_profile_keeps_credentials_out_of_environment(tmp_path: Path) -> None:

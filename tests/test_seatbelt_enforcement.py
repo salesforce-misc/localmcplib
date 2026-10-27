@@ -545,6 +545,22 @@ async def test_system_trust_store_is_readable_only_with_network(workspace: Works
         _assert_denied(result)
 
 
+async def test_a_symlinked_trust_store_target_outside_every_root_is_traversable(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle = workspace.outside / "store" / "certs" / "bundle.pem"
+    bundle.parent.mkdir(parents=True)
+    bundle.write_text("trust-store-bundle\n")
+    trust_store = workspace.outside / "cert.pem"
+    trust_store.symlink_to(bundle)
+    monkeypatch.setattr(seatbelt, "_TLS_FILES", (trust_store,))
+
+    result = await _run(workspace.profile(network=True), f"cat {trust_store} && ls -d {bundle.parent}")
+
+    assert result.exit_code == 0, result
+    assert result.stdout.splitlines() == ["trust-store-bundle", str(bundle.parent)]
+
+
 # Environment
 
 

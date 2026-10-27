@@ -665,9 +665,12 @@ class MacOSSandbox:
         _check_scratch(self._scratch_parent, self.roots)
         self._process_limit = _owned_process_limit()
         # Grant metadata reads along every granted path so deep installs (e.g. inside
-        # Xcode.app) stay traversable without opening the directories above them. The
-        # scratch parent is traversed too, to reach each command's TMPDIR.
-        granted = tuple(root.path for root in self.roots) + self._toolchain_trees + self._toolchain_files
+        # Xcode.app) and symlinked trust stores stay traversable without opening the
+        # directories above them. The scratch parent is traversed too, to reach each
+        # command's TMPDIR.
+        granted = (
+            tuple(root.path for root in self.roots) + self._toolchain_trees + self._toolchain_files + self._tls_files
+        )
         self._metadata_ancestors = tuple(
             sorted({*_path_ancestors((*granted, self._scratch_parent)), self._scratch_parent}, key=os.fspath)
         )
