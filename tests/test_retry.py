@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -8,12 +8,15 @@ import anthropic
 import httpx2 as httpx
 import openai
 import pytest
-from langchain.agents import create_agent
+from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
+from langchain_core.tools import tool
+from langchain_openai import StreamChunkTimeoutError
 from pydantic import BaseModel, PrivateAttr
 
+from localmcp.agents import create_agent
 from localmcp.retry import (
     _MAX_RESET_DELAY_SECONDS,
     ModelCallRetryMiddleware,
@@ -63,6 +66,7 @@ def test_only_transient_faults_are_retryable() -> None:
     assert is_retryable_error(openai.APIConnectionError(message="boom", request=request))
     assert is_retryable_error(openai.APITimeoutError(request=request))
     assert is_retryable_error(anthropic.APITimeoutError(request=request))
+    assert is_retryable_error(StreamChunkTimeoutError(120.0, model_name="gpt", chunks_received=3))
     assert not is_retryable_error(StatusError(400))
     assert not is_retryable_error(ValueError("validation"))
 
@@ -413,9 +417,72 @@ async def test_a_custom_retry_policy_and_callback_are_used(sleeps: list[float]) 
 
 def test_synchronous_agents_retry_a_transient_model_error(sleeps: list[float]) -> None:
     model = _ScriptedChatModel(responses=[StatusError(503), AIMessage(content="Paris")])
-    agent = create_agent(model, [], middleware=[ModelCallRetryMiddleware()])
+    agent = create_agent(model, [])
 
     result = agent.invoke({"messages": [HumanMessage(content="Capital of France?")]})
 
     assert result["messages"][-1].content == "Paris"
     assert len(sleeps) == 1
+
+
+def _lookup_call() -> AIMessage:
+    return AIMessage(
+        content="", tool_calls=[{"name": "lookup", "args": {"country": "France"}, "id": "l1", "type": "tool_call"}]
+    )
+
+
+class _CountingMiddleware(AgentMiddleware[Any, Any, Any]):
+    """Counts the model calls that reach it from the agent loop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls = 0
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest,
+        handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
+    ) -> ModelResponse:
+        self.calls += 1
+        return await handler(request)
+
+
+async def test_agents_retry_a_failed_model_call_without_replaying_earlier_tool_calls(sleeps: list[float]) -> None:
+    lookups: list[str] = []
+
+    @tool
+    def lookup(country: str) -> str:
+        """Look up a country's capital."""
+        lookups.append(country)
+        return "Paris"
+
+    model = _ScriptedChatModel(responses=[_lookup_call(), StatusError(503), AIMessage(content="Paris")])
+    outer = _CountingMiddleware()
+    agent = create_agent(model, [lookup], middleware=[outer])
+
+    result = await agent.ainvoke({"messages": [HumanMessage(content="Capital of France?")]})
+
+    assert result["messages"][-1].content == "Paris"
+    assert lookups == ["France"]
+    # Only the failed second turn is repeated, unchanged, beneath the caller's middleware.
+    assert len(model.requests) == 3
+    assert model.requests[1] == model.requests[2]
+    assert outer.calls == 2
+    assert len(sleeps) == 1
+
+
+async def test_an_agent_uses_the_retry_policy_it_is_given(sleeps: list[float]) -> None:
+    model = _ScriptedChatModel(responses=[StatusError(503), AIMessage(content="Paris")])
+    agent = create_agent(model, [], retry=ModelCallRetryMiddleware(max_attempts=1))
+
+    with pytest.raises(StatusError):
+        await agent.ainvoke({"messages": [HumanMessage(content="Capital of France?")]})
+    assert len(model.requests) == 1
+    assert sleeps == []
+
+
+def test_a_retry_policy_listed_as_middleware_is_rejected() -> None:
+    model = _ScriptedChatModel(responses=[])
+
+    with pytest.raises(ValueError, match="pass it as retry"):
+        create_agent(model, [], middleware=[ModelCallRetryMiddleware(max_attempts=3)])

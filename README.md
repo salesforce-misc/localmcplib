@@ -173,10 +173,15 @@ replaces `with_structured_output`, whose `function_calling` method forces
 answer = await submit_structured(model, Answer, system_prompt="...", messages=[HumanMessage("...")])
 ```
 
-`localmcp.retry.ModelCallRetryMiddleware` retries a single failed model call
-on rate limits, 5xx responses, and connection faults, including those that
-interrupt a streamed response, so a transient error does not restart an agent
-run or replay its tool calls. It is independent of the
+`localmcp.agents.create_agent` is LangChain's `create_agent` with
+`localmcp.retry.ModelCallRetryMiddleware` placed after the given middleware, so
+it wraps each model call directly. The middleware retries a single failed model
+call on rate limits, 5xx responses, and connection or timeout faults, including
+those that interrupt a streamed response, so a transient error does not restart
+an agent run or replay its tool calls. Models built by `localmcp.llm`'s
+factories with their default transports stream every response under a
+deadline, so a response that outlasts it fails as a timeout and is retried the
+same way; a model built elsewhere is used as given. It is independent of the
 correction loop: it repeats an identical request after a transport fault and
 never re-prompts, while the correction loop re-prompts after a model's answer
 and never retries transport errors. It also handles both OpenAI and Anthropic
@@ -184,11 +189,20 @@ SDK errors and gateway-specific rate-limit messages, so one policy applies
 whichever model and route an application is configured with. Rate limits wait for
 `Retry-After` or for a reset instant embedded in the error message; other
 errors use capped, jittered exponential backoff. Deterministic errors propagate
-immediately. `submit_structured` includes it by default. Place it after
-`SubmitResultMiddleware` so it wraps the model call directly:
+immediately. `submit_structured` builds its agent the same way. Pass `retry` to
+change the policy, or `ModelCallRetryMiddleware(max_attempts=1)` to disable it.
+Listing `ModelCallRetryMiddleware` in `middleware` raises `ValueError`, so code
+that added it there passes it as `retry` instead:
 
 ```python
-middleware = [SubmitResultMiddleware(Answer), ModelCallRetryMiddleware(max_attempts=3)]
+from localmcp.agents import create_agent
+
+agent = create_agent(
+    model,
+    tools,
+    middleware=[SubmitResultMiddleware(Answer)],
+    retry=ModelCallRetryMiddleware(max_attempts=5, on_retry=log_retry),
+)
 ```
 
 `call_with_rate_limit_retry`, `is_retryable_error`, and `rate_limit_delay`
@@ -272,7 +286,8 @@ grants, and tools installed elsewhere, such as under `~/.cargo/bin`, are not
 available. Configuration a tool reads from outside its own install, such as
 Homebrew OpenSSL's `etc/openssl@3`, is not granted either. The exception is a
 profile with `network`, which also grants the system TLS configuration and
-trust store in `/etc/ssl`, without which the system `curl` cannot start.
+trust store in `/etc/ssl`, without which the system `curl` cannot start. Where
+either is a symlink, the file it resolves to is granted as well.
 
 ### Durable workflows
 

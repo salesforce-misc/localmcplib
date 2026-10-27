@@ -139,8 +139,9 @@ DEFAULT_MODEL_REGISTRY = ModelRegistry(DEFAULT_MODEL_SPECS)
 # response: it limits only the wait between bytes, and providers keep sending
 # keep-alive events while a model thinks or stalls. The deadline cannot tell a
 # stalled response from a long one, so a model whose uncapped responses
-# routinely take longer needs a larger timeout or an output limit.
-DEFAULT_RESPONSE_TIMEOUT = 600.0
+# routinely take longer needs a larger timeout or an output limit. A stall
+# costs a full timeout before its retry, so the default stays at five minutes.
+DEFAULT_RESPONSE_TIMEOUT = 300.0
 
 
 def _validate_response_timeout(response_timeout: float) -> None:

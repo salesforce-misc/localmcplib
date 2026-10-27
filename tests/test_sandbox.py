@@ -193,6 +193,29 @@ def test_scratch_is_writable_only_when_a_root_is(tmp_path: Path) -> None:
     assert not any(line.startswith("(allow ") and "file-write" in line for line in read_only.splitlines())
 
 
+def test_network_grants_the_target_of_a_symlinked_tls_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    config = tmp_path / "openssl.cnf"
+    config.touch()
+    bundle = tmp_path / "store" / "bundle.pem"
+    bundle.parent.mkdir()
+    bundle.touch()
+    trust_store = tmp_path / "cert.pem"
+    trust_store.symlink_to(bundle)
+    monkeypatch.setattr(seatbelt, "_TLS_FILES", (config, trust_store))
+
+    online = MacOSSandbox(SandboxProfile((SandboxRoot(root),), network=True))
+    offline = MacOSSandbox(SandboxProfile((SandboxRoot(root),)))
+
+    assert online._tls_files == (config, trust_store, bundle.resolve())
+    assert '(allow file-read* (literal (param "TLS_FILE_2")))' in online._compiled_profile().splitlines()
+    assert bundle.parent.resolve() in online._metadata_ancestors
+    assert offline._tls_files == ()
+    assert "TLS_FILE" not in offline._compiled_profile()
+    assert bundle.parent.resolve() not in offline._metadata_ancestors
+
+
 def test_profile_keeps_credentials_out_of_environment(tmp_path: Path) -> None:
     sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),)))
 
