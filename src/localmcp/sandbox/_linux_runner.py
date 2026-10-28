@@ -80,6 +80,10 @@ class _LandlockRuleset(ctypes.Structure):
 
 
 class _LandlockPath(ctypes.Structure):
+    # TODO: Python 3.14 deprecates _pack_ without an explicit _layout_, and 3.19 will
+    # reject it. This runs under the host's /usr/bin/python3, so the sandbox would fail
+    # to start there. Setting _layout_ = "ms" likely fixes it; confirm the struct stays
+    # 12 bytes (packed landlock_path_beneath_attr) and that older Pythons ignore it.
     _pack_ = 1
     _fields_ = [("allowed_access", ctypes.c_uint64), ("parent_fd", ctypes.c_int32)]
 
