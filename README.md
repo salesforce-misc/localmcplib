@@ -228,7 +228,8 @@ space to fill. The directory is created in the caller's temporary directory,
 which must be outside every root, so what a command writes there counts against
 that volume rather than against any quota on a root's.
 
-`denied_paths` hide files and directories inside the roots. Seatbelt denies the
+`denied_paths` hide files and directories inside the roots. A denied path need
+not exist: one the host creates later is hidden too. Seatbelt denies the
 real path a file is opened by, so a denied path must not go through a symlink,
 and a denied file must have no other hard link, whose name would stay readable.
 The sandbox refuses to be created, or to run a command, while a denied path

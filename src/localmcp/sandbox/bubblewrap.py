@@ -64,6 +64,9 @@ _NETWORK_PATHS = tuple(
     )
 )
 _CONTROL = Path("/localmcp")
+# Hiding a missing denied path mounts each entry of its directory back individually,
+# so bound the mounts and arguments that one rebuilt directory can add.
+_MAX_REBUILT_ENTRIES = 1024
 # Snapshot trusted launcher code before a workload can modify an editable install.
 # Reading this file again per invocation would make a writable source checkout
 # capable of replacing the next command's privileged setup code.
@@ -329,13 +332,63 @@ class LinuxSandbox(CommandRuntime):
     def _validate_paths(self) -> None:
         _check_denied_paths(self.profile.denied_paths)
         _check_denied_paths(self._protected_paths, "read-only root")
-        for path in self.profile.denied_paths:
+
+    def _writable(self, path: Path) -> bool:
+        """Whether a read-write root holds ``path`` outside every write-protected root."""
+        return any(
+            root.access == RootAccess.READ_WRITE and path.is_relative_to(root.path) for root in self.roots
+        ) and not any(path.is_relative_to(protected) for protected in self._protected_paths)
+
+    def _denial_layout(self) -> tuple[dict[Path, bool], dict[Path, set[str]], tuple[Path, ...]]:
+        """Plan this command's denials from the host as it is now.
+
+        Returns the ancestors to pin, the read-only directories to rebuild without
+        their missing denied entries, and the denied paths that exist to cover.
+        """
+        denied = tuple(
+            path
+            for path in self.profile.denied_paths
+            if not any(path != other and path.is_relative_to(other) for other in self.profile.denied_paths)
+        )
+        pinned: dict[Path, bool] = {}
+        rebuilt: dict[Path, set[str]] = {}
+        present: list[Path] = []
+        for path in denied:
             try:
-                mode = path.lstat().st_mode
-            except FileNotFoundError as exc:
-                raise SandboxError(f"Linux sandbox denied path must exist: {path}") from exc
-            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
-                raise SandboxError(f"Linux sandbox denied path must be a regular file or directory: {path}")
+                path.lstat()
+            except (FileNotFoundError, NotADirectoryError):
+                pass
+            else:
+                present.append(path)
+                continue
+            # A missing path cannot be covered by a mount, so hide it in its nearest
+            # existing ancestor instead. A writable ancestor is left alone: rebuilding it
+            # would stop commands from changing it, so the path is covered by the first
+            # command after it appears.
+            child, parent = path, path.parent
+            while True:
+                if not any(parent.is_relative_to(root.path) for root in self.roots):
+                    raise SandboxError(f"sandbox root no longer exists for denied path: {path}")
+                try:
+                    mode = parent.lstat().st_mode
+                except (FileNotFoundError, NotADirectoryError):
+                    child, parent = parent, parent.parent
+                    continue
+                break
+            if self._writable(parent):
+                continue
+            if stat.S_ISLNK(mode):
+                raise SandboxError(f"sandbox denied path goes through a symlink and cannot be enforced: {path}")
+            if stat.S_ISDIR(mode):
+                rebuilt.setdefault(parent, set()).add(child.name)
+            else:
+                # Nothing can exist beneath a non-directory; pinning it keeps one from replacing it.
+                pinned[parent] = True
+        # Pin ancestors as mount points so a rename cannot relocate a protected path.
+        for path in _path_ancestors((*present, *self._protected_paths)):
+            if any(path.is_relative_to(root.path) for root in self.roots):
+                pinned.setdefault(path, not self._writable(path))
+        return pinned, rebuilt, tuple(present)
 
     def _invocation(self, command: str, scratch: Path, control: Path) -> tuple[list[str], dict[str, object]]:
         writable = any(root.access == RootAccess.READ_WRITE for root in self.roots)
@@ -385,18 +438,55 @@ class LinuxSandbox(CommandRuntime):
             for path in _NETWORK_PATHS:
                 if path.exists():
                     bind(path.resolve(), path)
+        pinned, rebuilt, present = self._denial_layout()
         mounts = {root.path: root.access == RootAccess.READ_ONLY for root in self.roots}
-        # Pin ancestors as mount points so a rename cannot relocate a protected path.
-        for path in _path_ancestors((*self.profile.denied_paths, *self._protected_paths)):
-            if any(path.is_relative_to(root.path) for root in self.roots):
-                mounts.setdefault(
-                    path,
-                    not any(
-                        root.access == RootAccess.READ_WRITE and path.is_relative_to(root.path) for root in self.roots
-                    ),
-                )
-        for path in sorted(mounts, key=lambda item: (len(item.parts), str(item))):
-            bind(path, path, read_only=mounts[path])
+        for path, read_only in pinned.items():
+            mounts.setdefault(path, read_only)
+        # A rebuilt directory is an empty tmpfs holding a mount for each of its entries
+        # except the missing denied ones, so one the host creates while the command runs
+        # stays hidden; the next command covers it. Symlinks are recreated, not followed.
+        # Other entries are recorded by identity: bwrap resolves each again when it mounts
+        # it, so the runner rejects one the host replaced in between, such as with a symlink.
+        entries: dict[Path, str | tuple[int, int]] = {}
+        for directory, missing in rebuilt.items():
+            listed = 0
+            try:
+                with os.scandir(directory) as scan:
+                    for entry in scan:
+                        path = directory / entry.name
+                        if entry.name in missing or path in present:
+                            continue
+                        if listed == _MAX_REBUILT_ENTRIES:
+                            raise SandboxError(
+                                f"Linux sandbox cannot hide missing denied paths in {directory}: "
+                                f"it holds more than {_MAX_REBUILT_ENTRIES} other entries"
+                            )
+                        listed += 1
+                        try:
+                            if entry.is_symlink():
+                                entries[path] = os.readlink(path)
+                            else:
+                                info = entry.stat(follow_symlinks=False)
+                                entries[path] = (info.st_dev, info.st_ino)
+                        except OSError:
+                            # Changed since it was listed; the next command sees what replaced it.
+                            continue
+            except OSError as exc:
+                raise SandboxError(f"cannot list a directory that holds a missing denied path: {directory}") from exc
+        identities: dict[str, tuple[int, int]] = {}
+        for path in sorted({*mounts, *rebuilt, *entries}, key=lambda item: (len(item.parts), str(item))):
+            if path in rebuilt:
+                argv.extend(["--tmpfs", str(path)])
+                readonly.append(str(path))
+            elif path in mounts:
+                bind(path, path, read_only=mounts[path])
+            elif isinstance(recorded := entries[path], str):
+                argv.extend(["--symlink", recorded, str(path)])
+            else:
+                # An entry removed since it was listed is skipped rather than failing the command.
+                argv.extend(["--ro-bind-try", str(path), str(path)])
+                readonly.append(str(path))
+                identities[str(path)] = recorded
         bind(scratch, scratch, read_only=not writable)
         for path in dict.fromkeys((*self._grants.helpers, *self._grants.executables, *self._grants.maps)):
             bind(path, path)
@@ -410,9 +500,8 @@ class LinuxSandbox(CommandRuntime):
             bind(control / name, _CONTROL / name)
         bind(control / "status", _CONTROL / "status", read_only=False)
         # Cover denials last; children of an already covered directory add no authority.
-        for path in self.profile.denied_paths:
-            if any(path != other and path.is_relative_to(other) for other in self.profile.denied_paths):
-                continue
+        # A placeholder file can cover any other non-directory, such as a socket or FIFO.
+        for path in present:
             bind(control / ("deny-dir" if path.is_dir() else "deny-file"), path)
         argv.extend(
             [
@@ -441,6 +530,7 @@ class LinuxSandbox(CommandRuntime):
             "executable_trees": list(map(str, self._grants.helpers)),
             "executable_maps": list(map(str, self._grants.maps)),
             "readonly_mounts": readonly,
+            "entry_identities": identities,
             "read_directories": [str(root.path) for root in self.roots]
             + list(map(str, self._runtime_trees))
             + [str(scratch), "/dev", "/proc"]
@@ -469,7 +559,8 @@ class LinuxSandbox(CommandRuntime):
             (control / "status").touch(mode=0o600)
             (control / "deny-file").touch(mode=0o000)
             (control / "deny-dir").mkdir(mode=0o000)
-            argv, profile = self._invocation(command, scratch, control)
+            # Planning lists rebuilt directories, so keep that filesystem work off the event loop.
+            argv, profile = await asyncio.to_thread(self._invocation, command, scratch, control)
             (control / "profile.json").write_text(json.dumps(profile))
             # bwrap's info FD reports the host PID of our namespace init, never a workload-owned FD.
             with (control / "info").open("w+b") as info:

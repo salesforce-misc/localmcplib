@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import http.server
 import os
 import shlex
@@ -11,9 +12,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -169,6 +171,133 @@ async def test_host_hard_links_are_rechecked_before_each_invocation(workspace: W
         await sandbox.run("cat secret")
     with pytest.raises(SandboxError, match="hard link"):
         LinuxSandbox(profile)
+
+
+async def test_missing_read_only_denials_stay_hidden_as_they_come_and_go(workspace: Workspace) -> None:
+    (workspace.readonly / "data").write_text("visible")
+    secret = workspace.readonly / "secret"
+    token = workspace.readonly / "config" / "token"
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(secret, token)))
+    listing = f"ls -A {workspace.readonly} && cat {workspace.readonly}/data"
+
+    result = await sandbox.run(listing)
+    assert result.exit_code == 0, result
+    assert result.stdout == "data\nvisible"
+    for command in (f"printf leaked > {secret}", f"mkdir {token.parent}"):
+        _denied(await sandbox.run(command))
+    assert sorted(path.name for path in workspace.readonly.iterdir()) == ["data"]
+
+    secret.write_text("secret-sentinel")
+    token.parent.mkdir()
+    token.write_text("secret-sentinel")
+    for command in (f"cat {secret}", f"cat {token}", f"cp {secret} copy", f"rm {secret}"):
+        _denied(await sandbox.run(command))
+    assert secret.read_text() == "secret-sentinel"
+
+    secret.unlink()
+    token.unlink()
+    token.parent.rmdir()
+    result = await sandbox.run(listing)
+    assert result.exit_code == 0, result
+    assert result.stdout == "data\nvisible"
+
+
+def _create_when_read(ready: Path, secret: Path) -> None:
+    """Create ``secret`` once a command is blocked reading ``ready``, then let it continue."""
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            descriptor = os.open(ready, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno != errno.ENXIO or time.monotonic() > deadline:
+                raise
+            time.sleep(0.01)
+        else:
+            break
+    try:
+        secret.write_text("secret-sentinel")
+        os.write(descriptor, b"go\n")
+    finally:
+        os.close(descriptor)
+
+
+async def test_read_only_denial_created_while_a_command_runs_stays_hidden(workspace: Workspace) -> None:
+    secret = workspace.readonly / "secret"
+    ready = workspace.writable / "ready"
+    os.mkfifo(ready)
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(secret,)))
+    running = asyncio.create_task(sandbox.run(f"read line < ready && ls -A {workspace.readonly} && cat {secret}"))
+    await asyncio.to_thread(_create_when_read, ready, secret)
+    result = await running
+    _denied(result)
+    assert result.stdout == ""
+    _denied(await sandbox.run(f"cat {secret}"))
+
+
+def _change_after_planning(sandbox: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, change: Callable[[], None]) -> None:
+    """Make the host ``change`` once the command's mounts are planned, before bwrap makes them."""
+    plan = sandbox._invocation
+
+    def planned_then_changed(*args: Any) -> Any:
+        planned = plan(*args)
+        change()
+        return planned
+
+    monkeypatch.setattr(sandbox, "_invocation", planned_then_changed)
+
+
+async def test_rebuilt_entry_replaced_during_setup_fails_closed(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = workspace.readonly / "data"
+    data.write_text("visible")
+    (workspace.outside / "secret").write_text("secret-sentinel")
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(workspace.readonly / "missing",)))
+
+    def replace_with_symlink() -> None:
+        data.unlink()
+        data.symlink_to(workspace.outside / "secret")
+
+    _change_after_planning(sandbox, monkeypatch, replace_with_symlink)
+    with pytest.raises(SandboxError, match="entry changed while the sandbox was being prepared"):
+        await sandbox.run(f"cat {data}")
+
+
+async def test_rebuilt_entry_removed_during_setup_is_left_out(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (workspace.readonly / "data").write_text("visible")
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(workspace.readonly / "missing",)))
+    _change_after_planning(sandbox, monkeypatch, (workspace.readonly / "data").unlink)
+
+    result = await sandbox.run(f"ls -A {workspace.readonly}")
+    assert result.exit_code == 0, result
+    assert result.stdout == ""
+
+
+async def test_denied_fifos_and_sockets_are_covered(workspace: Workspace) -> None:
+    fifo = workspace.readonly / "fifo"
+    os.mkfifo(fifo)
+    address = workspace.readonly / "socket"
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(address))
+        server.listen()
+        profile = workspace.profile(denied_paths=(fifo, address))
+        for command in (f"test -p {fifo}", f"test -S {address}", f"cat {fifo}", f"cat {address}"):
+            _denied(await _run(profile, command, timeout_seconds=5))
+
+
+async def test_writable_denial_created_by_a_command_is_covered_from_the_next(workspace: Workspace) -> None:
+    secret = workspace.writable / "config" / "secret"
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(secret,)))
+    # A command can create a missing denied path in a writable directory. Seatbelt denies reading it
+    # at once; this backend covers it from the next command.
+    created = await sandbox.run("mkdir config && printf secret-sentinel > config/secret")
+    assert created.exit_code == 0, created
+    for command in ("cat config/secret", "rm config/secret", "mv config moved", "ln config/secret alias"):
+        _denied(await sandbox.run(command))
+    assert secret.read_text() == "secret-sentinel"
+    assert sorted(path.name for path in workspace.writable.iterdir()) == ["config"]
 
 
 @pytest.mark.parametrize(

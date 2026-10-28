@@ -68,8 +68,8 @@ def _check_denied_paths(denied_paths: tuple[Path, ...], kind: str = "denied path
     """
 
     def uncheckable(error: OSError) -> None:
-        # A file that is gone has no other name.
-        if not isinstance(error, FileNotFoundError):
+        # A file that is gone, or would lie beneath a non-directory, has no other name.
+        if not isinstance(error, (FileNotFoundError, NotADirectoryError)):
             raise SandboxError(f"sandbox {kind} cannot be checked for hard links: {error.filename}") from error
 
     for denied in denied_paths:

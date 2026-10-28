@@ -172,6 +172,22 @@ def _mounts() -> list[tuple[str, int]]:
     return sorted(mounts.items(), key=lambda item: len(item[0].split("/")), reverse=True)
 
 
+def _check_entry_identities(profile: dict[str, Any]) -> None:
+    """Fail unless each entry mounted into a rebuilt directory is the one the host listed.
+
+    bwrap resolves each entry again when it mounts it. One the host replaced in between,
+    such as with a symlink to elsewhere, would mount whatever the replacement names.
+    """
+    for path, (device, inode) in profile.get("entry_identities", {}).items():
+        try:
+            info = os.lstat(path)
+        except FileNotFoundError:
+            # Removed since it was listed, so bwrap mounted nothing.
+            continue
+        if (info.st_dev, info.st_ino) != (device, inode):
+            raise RuntimeError(f"sandbox entry changed while the sandbox was being prepared: {path}")
+
+
 def _lock_mounts(profile: dict[str, Any], library: ctypes.CDLL) -> None:
     executables = set(profile["executables"]) | set(profile.get("executable_maps", ()))
     executable_trees = tuple(profile["executable_trees"])
@@ -465,6 +481,7 @@ def main() -> None:
         library = _libc()
         # Load libseccomp and all Python extensions before making their mounts noexec.
         policy = _Seccomp()
+        _check_entry_identities(profile)
         _lock_mounts(profile, library)
         _drop_capabilities(library)
         read_fd, error_fd = os.pipe2(os.O_CLOEXEC)
