@@ -102,8 +102,9 @@ Seatbelt semantics cannot yet be reproduced:
   sockets. Name resolution uses glibc's built-in `files` and `dns` sources,
   which requires glibc 2.34 or newer. Other NSS modules named in
   `nsswitch.conf`, such as `resolve` or `mdns`, are not loaded; lookups
-  continue with the next source as `nsswitch.conf` directs. With networking disabled, socket creation is denied in addition to
-  network namespace isolation, so private loopback is not an escape hatch.
+  continue with the next source as `nsswitch.conf` directs. With networking
+  disabled, socket creation is denied in addition to network namespace
+  isolation, so private loopback is not an escape hatch.
 - `ipc=True` enables POSIX and SysV shared memory in a private IPC namespace;
   it does not expose host shared-memory objects or enable semaphores, message
   queues, or sockets. POSIX shared memory is an explicit writable memory-backed

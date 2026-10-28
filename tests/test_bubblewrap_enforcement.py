@@ -6,6 +6,7 @@ import asyncio
 import http.server
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -424,9 +425,20 @@ async def test_network_requires_explicit_grant(workspace: Workspace, http_port: 
         _denied(result, secret="network-ok")
 
 
-async def test_network_grant_resolves_host_names(workspace: Workspace) -> None:
+async def test_network_grant_reads_the_hosts_file(workspace: Workspace) -> None:
     result = await _run(workspace.profile(tools=("getent",), network=True), "getent hosts localhost")
     assert result.exit_code == 0 and "localhost" in result.stdout, result
+
+
+async def test_network_grant_resolves_names_through_dns(workspace: Workspace) -> None:
+    # The hosts file does not list this name, so only the dns source can answer it.
+    name = "example.com"
+    try:
+        await asyncio.to_thread(socket.getaddrinfo, name, None)
+    except socket.gaierror:
+        pytest.skip(f"the host cannot resolve {name}")
+    result = await _run(workspace.profile(tools=("getent",), network=True), f"getent hosts {name}")
+    assert result.exit_code == 0 and name in result.stdout, result
 
 
 @pytest.mark.parametrize("ipc", [False, True])
