@@ -33,6 +33,11 @@ make ci
 make build
 ```
 
+`make test`, `make coverage`, and `make ci` detect the host OS and require its
+real sandbox enforcement: Seatbelt on macOS and bubblewrap on Linux. To run
+only a backend's enforcement tests, use `make test-seatbelt` or
+`make test-bubblewrap`; these fail when that backend is unavailable.
+
 Changes to observable behavior should include focused tests at a stable public
 boundary. Keep pull requests narrowly scoped, document public contract changes,
 and update examples when appropriate.

@@ -15,6 +15,7 @@ from localmcp.sandbox.base import (
     SandboxProfile,
     SandboxRoot,
 )
+from localmcp.sandbox.tools import ToolCallBudget, create_sandbox, sandbox_tools
 
 __all__ = [
     "DEFAULT_COMMAND_TIMEOUT_SECONDS",
@@ -30,4 +31,7 @@ __all__ = [
     "SandboxProfile",
     "SandboxRoot",
     "WRITE_TOOLS",
+    "ToolCallBudget",
+    "create_sandbox",
+    "sandbox_tools",
 ]

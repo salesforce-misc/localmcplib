@@ -25,6 +25,8 @@ jobs:
   test:
     name: Test Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    env:
+      LOCALMCP_REQUIRE_BUBBLEWRAP: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +37,14 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
+      - name: Install Linux sandbox dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap python3 libseccomp2 libc-bin file git curl util-linux
+          # The disposable runner must permit the user namespaces under test.
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: Install dependencies
         run: make install
       - name: Run checks

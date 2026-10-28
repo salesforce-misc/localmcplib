@@ -215,8 +215,12 @@ The sandbox API provides bounded command execution with explicit filesystem
 roots, a clean environment, a private temporary directory per command, output
 and time limits, and network access disabled by default. When a command returns
 or times out, every process it started is killed, including background and
-detached ones. The current implementation uses macOS Seatbelt; the portable
-interface leaves room for a future Linux backend.
+detached ones. `create_sandbox(profile)` selects macOS Seatbelt or the Linux
+bubblewrap backend. The package-level `sandbox_tools` uses the same platform
+selection; the existing `seatbelt.sandbox_tools` remains macOS-specific.
+Linux requires bubblewrap, system Python 3, libseccomp, a merged `/usr`, and
+enabled user namespaces and Landlock. See [Linux sandbox support](docs/linux-sandbox.md)
+for installation, usage, and the remaining semantic differences.
 
 Nothing limits how much a command writes. Its temporary directory is writable
 only when the profile has a read-write root, so a read-only profile gets no
