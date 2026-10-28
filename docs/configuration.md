@@ -99,7 +99,7 @@ A streamed response is never idle for long: providers send keep-alive events
 while a model thinks, so the SDKs' read timeout, which bounds only the wait
 between bytes, cannot end a stalled one. `[llm].response_timeout` therefore
 bounds each response as a whole, from sending its request to its last streamed
-byte, in seconds (default 600; it must be finite). The deadline applies to
+byte, in seconds (default 300; it must be finite). The deadline applies to
 each HTTP attempt. When it passes before the response begins, the provider SDK
 retries the request itself (twice by default) and then raises its own timeout
 error; when it passes mid-stream, the response fails with
@@ -108,6 +108,13 @@ deadline cannot distinguish a stalled response from a long one, and a retry
 repeats the same request, so a model whose uncapped responses routinely
 outlast it fails every attempt: raise the timeout or set an output limit for
 such models.
+
+OpenAI-dialect models are also bounded by `langchain-openai`'s own
+`stream_chunk_timeout`, which ends an async stream that yields no content for
+120 seconds, even while keep-alives still arrive. Set
+`LANGCHAIN_OPENAI_STREAM_CHUNK_TIMEOUT_S` to change it, or to `0` to disable
+it. `localmcp.retry` treats its `StreamChunkTimeoutError` as a transient fault
+as well.
 
 ```toml
 [llm]

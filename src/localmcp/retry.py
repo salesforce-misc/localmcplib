@@ -14,6 +14,7 @@ import anthropic
 import httpx2
 import openai
 from langchain.agents.middleware import AgentMiddleware, ModelRequest, ModelResponse
+from langchain_openai import StreamChunkTimeoutError
 
 from localmcp.observability.logging import get_logger
 
@@ -44,7 +45,14 @@ _TRANSIENT_STREAM_ERRORS = frozenset({"api_error", "overloaded_error", "server_e
 
 # A connection that drops or stalls mid-stream raises the transport error
 # directly; the SDKs wrap only failures before the response starts.
-_TRANSIENT_STREAM_FAULTS = (httpx2.NetworkError, httpx2.RemoteProtocolError, httpx2.TimeoutException)
+# ChatOpenAI raises StreamChunkTimeoutError when an async stream yields no
+# content for its stream_chunk_timeout, even while keep-alives still arrive.
+_TRANSIENT_STREAM_FAULTS = (
+    httpx2.NetworkError,
+    httpx2.RemoteProtocolError,
+    httpx2.TimeoutException,
+    StreamChunkTimeoutError,
+)
 
 
 def _stream_error_kinds(exc: BaseException) -> set[str]:
