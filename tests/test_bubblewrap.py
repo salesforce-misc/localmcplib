@@ -61,10 +61,11 @@ def test_backend_preserves_first_root_and_nested_protection(backend: LinuxSandbo
         )
 
 
-def test_denied_paths_require_existing_in_root_targets(backend: LinuxSandbox, tmp_path: Path) -> None:
-    missing = backend.root / "missing"
-    with pytest.raises(SandboxError, match="must exist"):
-        LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(missing,)))
+def test_denied_paths_need_not_exist_but_must_lie_in_roots(backend: LinuxSandbox, tmp_path: Path) -> None:
+    (backend.root / "file").touch()
+    LinuxSandbox(
+        SandboxProfile(backend.roots, denied_paths=(backend.root / "missing" / "deeper", backend.root / "file" / "key"))
+    )
     outside = tmp_path / "outside"
     outside.touch()
     with pytest.raises(SandboxError, match="outside"):
@@ -117,6 +118,184 @@ def test_mount_order_keeps_narrower_protection_and_denials(backend: LinuxSandbox
     assert "--as-pid-1" in argv
     assert profile["command"] == "printf ok"
     assert str(backend.root) in profile["write_paths"]
+
+
+_MOUNT_ARITY = {"--tmpfs": 1, "--symlink": 2, "--bind": 2, "--ro-bind": 2, "--ro-bind-try": 2}
+
+
+def _mounts(argv: list[str], under: Path) -> list[tuple[str, ...]]:
+    """Return the mount operations whose target lies under ``under``, in order."""
+    operations: list[tuple[str, ...]] = []
+    index = 0
+    while index < len(argv):
+        arity = _MOUNT_ARITY.get(argv[index])
+        if arity is None:
+            index += 1
+            continue
+        operation = tuple(argv[index : index + arity + 1])
+        if Path(operation[-1]).is_relative_to(under):
+            operations.append(operation)
+        index += arity + 1
+    return operations
+
+
+def test_missing_read_only_denials_are_left_out_of_rebuilt_directories(backend: LinuxSandbox, tmp_path: Path) -> None:
+    root = tmp_path / "ro"
+    (root / "nested").mkdir(parents=True)
+    (root / "nested" / "kept").touch()
+    (root / "data").touch()
+    (root / "alias").symlink_to(tmp_path / "outside")
+    secret = root / "secret"
+    secret.touch()
+    sandbox = LinuxSandbox(
+        SandboxProfile(
+            (SandboxRoot(root),), denied_paths=(root / "missing", secret, root / "nested" / "absent" / "deeper")
+        )
+    )
+    control = tmp_path / "control"
+    argv, profile = sandbox._invocation("true", tmp_path / "scratch", control)
+
+    assert _mounts(argv, root) == [
+        ("--tmpfs", str(root)),
+        ("--symlink", str(tmp_path / "outside"), str(root / "alias")),
+        ("--ro-bind-try", str(root / "data"), str(root / "data")),
+        ("--tmpfs", str(root / "nested")),
+        ("--ro-bind-try", str(root / "nested" / "kept"), str(root / "nested" / "kept")),
+        ("--ro-bind", str(control / "deny-file"), str(secret)),
+    ]
+    assert {str(root), str(root / "nested")} <= set(profile["readonly_mounts"])
+
+
+def test_rebuilt_directories_keep_the_access_of_roots_inside_them(backend: LinuxSandbox, tmp_path: Path) -> None:
+    parent = tmp_path / "ro"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    protected = backend.root / "docs"
+    protected.mkdir()
+    sandbox = LinuxSandbox(
+        SandboxProfile(
+            (
+                SandboxRoot(backend.root, RootAccess.READ_WRITE),
+                SandboxRoot(protected),
+                SandboxRoot(parent),
+                SandboxRoot(child, RootAccess.READ_WRITE),
+            ),
+            denied_paths=(parent / "missing", protected / "missing"),
+        )
+    )
+    argv, profile = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    assert _mounts(argv, parent) == [("--tmpfs", str(parent)), ("--bind", str(child), str(child))]
+    assert _mounts(argv, backend.root) == [
+        ("--bind", str(backend.root), str(backend.root)),
+        ("--tmpfs", str(protected)),
+    ]
+    assert str(protected) in profile["readonly_mounts"]
+    assert str(child) in profile["write_paths"]
+
+
+def test_missing_writable_denials_are_covered_once_they_exist(backend: LinuxSandbox, tmp_path: Path) -> None:
+    secret = backend.root / "config" / "secret"
+    sandbox = LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(secret,)))
+    control = tmp_path / "control"
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
+
+    assert _mounts(argv, backend.root) == [("--bind", str(backend.root), str(backend.root))]
+    secret.parent.mkdir()
+    secret.touch()
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
+    assert _mounts(argv, backend.root) == [
+        ("--bind", str(backend.root), str(backend.root)),
+        ("--bind", str(secret.parent), str(secret.parent)),
+        ("--ro-bind", str(control / "deny-file"), str(secret)),
+    ]
+
+
+def test_missing_denial_beneath_a_file_pins_the_file(backend: LinuxSandbox, tmp_path: Path) -> None:
+    root = tmp_path / "ro"
+    root.mkdir()
+    blocker = root / "blocker"
+    blocker.touch()
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(blocker / "secret",)))
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    assert _mounts(argv, root) == [("--ro-bind", str(root), str(root)), ("--ro-bind", str(blocker), str(blocker))]
+
+
+def test_rebuilt_directories_are_bounded(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "ro"
+    root.mkdir()
+    (root / "one").touch()
+    (root / "two").touch()
+    monkeypatch.setattr(linux, "_MAX_REBUILT_ENTRIES", 2)
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "missing",)))
+    sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    (root / "three").touch()
+    with pytest.raises(SandboxError, match="more than 2 entries"):
+        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+
+def test_denial_layouts_fail_closed_when_the_host_changes_unexpectedly(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "ro"
+    root.mkdir()
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "link" / "secret",)))
+    (root / "link").symlink_to(tmp_path)
+    with pytest.raises(SandboxError, match="goes through a symlink"):
+        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    (root / "link").unlink()
+
+    scandir = os.scandir
+
+    def unlistable(path: Path) -> Any:
+        if path == root:
+            raise PermissionError(13, "Permission denied", str(path))
+        return scandir(path)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(linux.os, "scandir", unlistable)
+        with pytest.raises(SandboxError, match="cannot list"):
+            sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    root.rmdir()
+    with pytest.raises(SandboxError, match="root no longer exists"):
+        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+
+def test_rebuilt_entries_that_change_while_listed_are_left_out(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    root = tmp_path / "ro"
+    root.mkdir()
+    (root / "alias").symlink_to("gone")
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "missing",)))
+
+    readlink = os.readlink
+
+    def replaced(path: Path) -> str:
+        if path == root / "alias":
+            raise OSError(22, "Invalid argument", str(path))
+        return readlink(path)
+
+    monkeypatch.setattr(linux.os, "readlink", replaced)
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    assert _mounts(argv, root) == [("--tmpfs", str(root))]
+
+
+def test_denied_special_files_are_covered_by_the_placeholder_file(backend: LinuxSandbox, tmp_path: Path) -> None:
+    fifo = backend.root / "fifo"
+    os.mkfifo(fifo)
+    control = tmp_path / "control"
+    sandbox = LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(fifo,)))
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
+
+    assert _mounts(argv, fifo) == [("--ro-bind", str(control / "deny-file"), str(fifo))]
 
 
 def test_read_only_profile_does_not_gain_writable_scratch(backend: LinuxSandbox, tmp_path: Path) -> None:

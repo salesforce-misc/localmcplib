@@ -9,6 +9,7 @@ a CI job dedicated to enforcement cannot pass with every test skipped.
 from __future__ import annotations
 
 import asyncio
+import errno
 import http.server
 import os
 import socket
@@ -384,6 +385,65 @@ async def test_renaming_ancestor_of_denied_path_does_not_expose_it(workspace: Wo
     result = await _run(workspace.profile(denied_paths=(denied,)), "mv config exposed && cat exposed/secrets/token.txt")
 
     _assert_denied(result, leaked="nested-secret")
+
+
+async def test_missing_denied_paths_are_denied_once_they_exist(workspace: Workspace) -> None:
+    (workspace.read_only / "data").write_text("visible")
+    secret = workspace.read_only / "secret"
+    token = workspace.read_only / "config" / "token"
+    sandbox = MacOSSandbox(workspace.profile(denied_paths=(secret, token)))
+    listing = f"ls -A {workspace.read_only} && cat {workspace.read_only}/data"
+
+    result = await sandbox.run(listing)
+    assert result.exit_code == 0, result
+    assert result.stdout == "data\nvisible"
+
+    secret.write_text("denied-file-secret")
+    token.parent.mkdir()
+    token.write_text("denied-file-secret")
+    for command in (f"cat {secret}", f"cat {token}", f"cp {secret} copy"):
+        _assert_denied(await sandbox.run(command), leaked="denied-file-secret")
+
+
+def _create_when_read(ready: Path, secret: Path) -> None:
+    """Create ``secret`` once a command is blocked reading ``ready``, then let it continue."""
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            descriptor = os.open(ready, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError as exc:
+            if exc.errno != errno.ENXIO or time.monotonic() > deadline:
+                raise
+            time.sleep(0.01)
+        else:
+            break
+    try:
+        secret.write_text("denied-file-secret")
+        os.write(descriptor, b"go\n")
+    finally:
+        os.close(descriptor)
+
+
+async def test_denied_path_created_while_a_command_runs_is_denied(workspace: Workspace) -> None:
+    secret = workspace.read_only / "secret"
+    ready = workspace.read_write / "ready"
+    os.mkfifo(ready)
+    sandbox = MacOSSandbox(workspace.profile(denied_paths=(secret,)))
+    running = asyncio.create_task(sandbox.run(f"read line < ready && cat {secret}"))
+    await asyncio.to_thread(_create_when_read, ready, secret)
+
+    _assert_denied(await running, leaked="denied-file-secret")
+
+
+async def test_denied_path_created_by_a_command_cannot_be_read_or_removed(workspace: Workspace) -> None:
+    secret = workspace.read_write / "config" / "secret"
+    sandbox = MacOSSandbox(workspace.profile(denied_paths=(secret,)))
+
+    created = await sandbox.run("mkdir config && printf denied-file-secret > config/secret")
+    assert created.exit_code == 0, created
+    for command in ("cat config/secret", "rm config/secret", "mv config moved"):
+        _assert_denied(await sandbox.run(command), leaked="denied-file-secret")
+    assert secret.read_text() == "denied-file-secret"
 
 
 async def test_paths_unrelated_to_denied_paths_can_be_renamed(

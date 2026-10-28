@@ -50,7 +50,15 @@ again before each command, including host-created hard links.
 Writable roots expose host writes directly. Read-only mounts also prevent
 metadata changes such as `chmod`. Protected and denied ancestors are pinned
 as mount points so commands cannot rename them to evade the policy. Denied
-files and directories are covered by inaccessible, read-only mounts.
+paths that exist are covered by inaccessible, read-only mounts; a placeholder
+file covers any non-directory, such as a FIFO or socket.
+
+A missing denied path cannot be covered by a mount, so in a read-only
+directory its nearest existing ancestor is rebuilt for the command: an empty,
+read-only tmpfs holding a read-only mount of every other entry, with symlinks
+recreated rather than followed. A denied path the host creates while the
+command runs therefore stays hidden, and the next command covers it. Beneath a
+file, the file itself is pinned instead.
 
 Every invocation receives a private temporary directory outside the roots.
 It is writable only when at least one root is writable, and is removed after
@@ -80,10 +88,17 @@ commands have independent namespaces and temporary directories.
 This is an initial Linux implementation, with explicit restrictions where
 Seatbelt semantics cannot yet be reproduced:
 
-- A denied path must already exist as a regular file or directory. Missing
-  denied paths are rejected before execution. Linux denied mounts also block
-  writes; Seatbelt's current denied-path rules specifically block reads and
-  unlink operations.
+- Denied paths are planned from the host as each command starts. A missing
+  denied path in a directory that commands can write is not hidden: as on
+  macOS, a command can create it, but unlike Seatbelt that command, and any
+  command already running, can read what it holds until it exits. The next
+  command covers it. Linux denied mounts also block writes; Seatbelt's current
+  denied-path rules specifically block reads and unlink operations.
+- A read-only directory rebuilt to hide a missing denied path is fixed for the
+  duration of the command. Entries the host adds while it runs stay hidden, a
+  file the host replaces with a new one keeps its earlier contents, and the
+  directory itself reports mode `0755`. It may hold at most 1,024 other entries;
+  beyond that, the command is rejected.
 - A script tool requires its shebang interpreter to be explicitly listed in
   the required `tools` list (the shell is always available). Without that grant,
   a required script tool is rejected and an optional one is omitted. This avoids

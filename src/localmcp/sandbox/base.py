@@ -76,7 +76,8 @@ class SandboxProfile:
     The first root is the process working directory. A read-only root inside
     a read-write root is write-protected there: it stays readable, but nothing
     in it can be written, created, renamed, removed, or linked to a new name.
-    ``ipc`` permits
+    ``denied_paths`` are hidden from commands; each must lie inside a root but
+    need not exist, and one created later is hidden too. ``ipc`` permits
     shared-memory IPC only, not sockets or platform service protocols.
     ``tools`` lists every command that commands may run besides shell
     builtins, such as ``(*INSPECTION_TOOLS, "git")``, and defaults to
