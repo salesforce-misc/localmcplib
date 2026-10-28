@@ -13,6 +13,7 @@ import errno
 import json
 import os
 import resource
+import signal
 import sys
 from typing import Any
 
@@ -431,6 +432,10 @@ def _child(profile: dict[str, Any], library: ctypes.CDLL, policy: _Seccomp, erro
         _landlock(profile, library)
         _seccomp(profile, policy)
         policy.close()
+        # Python ignores these at startup, and an ignored signal stays ignored across
+        # exec; restore the defaults so a closed pipe ends its writer quietly.
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+        signal.signal(signal.SIGXFSZ, signal.SIG_DFL)
         # The explicit marker distinguishes an early setup crash from a
         # successful exec closing the CLOEXEC pipe. An exec failure appends its
         # error to the marker and is still reported as a setup failure.

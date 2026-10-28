@@ -18,6 +18,7 @@ import pytest
 
 from localmcp.sandbox import (
     INSPECTION_TOOLS,
+    MAX_ADDITIONAL_PROCESSES,
     WRITE_TOOLS,
     CommandResult,
     RootAccess,
@@ -313,6 +314,37 @@ async def test_combined_output_limit_is_enforced(workspace: Workspace) -> None:
     assert len(result.stdout.encode()) + len(captured_stderr.encode()) == 4096
 
 
+async def test_closed_pipes_end_writers_quietly(workspace: Workspace) -> None:
+    result = await _run(workspace.profile(tools=("yes", "head")), "yes | head -n 1")
+    assert result == CommandResult(exit_code=0, stdout="y\n", stderr=""), result
+
+
+_FORKS = """import os
+count = 0
+try:
+    while count < 1024:
+        if os.fork() == 0:
+            os.pause()
+            os._exit(0)
+        count += 1
+except BlockingIOError:
+    print(count)
+"""
+
+
+async def test_process_limit_ignores_the_callers_other_processes(workspace: Workspace) -> None:
+    # Host processes the caller already runs must not enlarge the command's allowance.
+    holders = [subprocess.Popen(["/usr/bin/sleep", "30"]) for _ in range(16)]
+    try:
+        result = await _run(workspace.profile(tools=("python3",)), f"python3 -I -S -c {shlex.quote(_FORKS)}")
+    finally:
+        for holder in holders:
+            holder.kill()
+            holder.wait()
+    assert result.exit_code == 0 and result.stdout.strip(), result
+    assert 0 < int(result.stdout) <= MAX_ADDITIONAL_PROCESSES
+
+
 _DETACHED = """import os,time
 if os.fork(): os._exit(0)
 os.setsid()
@@ -390,6 +422,11 @@ async def test_network_requires_explicit_grant(workspace: Workspace, http_port: 
         assert result.exit_code == 0 and result.stdout == "network-ok", result
     else:
         _denied(result, secret="network-ok")
+
+
+async def test_network_grant_resolves_host_names(workspace: Workspace) -> None:
+    result = await _run(workspace.profile(tools=("getent",), network=True), "getent hosts localhost")
+    assert result.exit_code == 0 and "localhost" in result.stdout, result
 
 
 @pytest.mark.parametrize("ipc", [False, True])

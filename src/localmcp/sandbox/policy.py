@@ -50,6 +50,14 @@ def _validated_roots(roots: tuple[SandboxRoot, ...]) -> tuple[SandboxRoot, ...]:
     return tuple(normalized)
 
 
+def _denied_paths_in_roots(denied_paths: tuple[Path, ...], roots: tuple[SandboxRoot, ...]) -> tuple[Path, ...]:
+    """Make denied paths absolute without following symlinks, dedupe them, and require each inside a root."""
+    normalized = tuple(dict.fromkeys(Path(os.path.abspath(path)) for path in denied_paths))
+    if any(not any(path.is_relative_to(root.path) for root in roots) for path in normalized):
+        raise SandboxError("sandbox denied path is outside its declared roots")
+    return normalized
+
+
 def _check_denied_paths(denied_paths: tuple[Path, ...], kind: str = "denied path") -> None:
     """Reject aliases that would undermine path-based access restrictions.
 

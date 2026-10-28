@@ -10,7 +10,6 @@ import asyncio
 import json
 import os
 import re
-import resource
 import signal
 import stat
 import struct
@@ -23,7 +22,6 @@ from pathlib import Path
 from localmcp.sandbox.base import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MAX_OUTPUT_BYTES,
-    MAX_ADDITIONAL_PROCESSES,
     MAX_OPEN_FILES,
     CommandResult,
     RootAccess,
@@ -33,6 +31,7 @@ from localmcp.sandbox.base import (
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
+    _denied_paths_in_roots,
     _path_ancestors,
     _protected_roots,
     _validated_roots,
@@ -41,11 +40,14 @@ from localmcp.sandbox.runtime import (
     CommandRuntime,
     _OutputLimitExceeded,
     command_environment,
+    process_limit,
     validate_command,
     validate_limits,
 )
 
 _BIN_DIRECTORIES = tuple(map(Path, ("/usr/bin", "/bin", "/usr/sbin", "/sbin")))
+# Tool code is trusted only beneath /usr, so these must be merged-/usr links into it.
+_MERGED_USR_LINKS = tuple(map(Path, ("/bin", "/sbin", "/lib", "/lib64")))
 _RUNTIME_TREES = tuple(map(Path, ("/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec")))
 _NETWORK_PATHS = tuple(
     map(
@@ -71,6 +73,9 @@ _RUNNER_SOURCE = Path(__file__).with_name("_linux_runner.py").read_bytes()
 def _require_linux() -> None:
     if sys.platform != "linux":
         raise SandboxError("Linux bubblewrap sandbox is unavailable on this platform")
+    for path in _MERGED_USR_LINKS:
+        if path.is_dir() and not path.is_symlink():
+            raise SandboxError(f"Linux sandbox requires a merged /usr, but {path} is a separate directory")
 
 
 def _trusted_program(path: Path) -> Path:
@@ -267,18 +272,6 @@ def _tool_grants(profile: SandboxProfile) -> _Tools:
     )
 
 
-def _process_limit() -> int | None:
-    try:
-        owned = sum(entry.stat().st_uid == os.getuid() for entry in Path("/proc").iterdir() if entry.name.isdecimal())
-        soft, _ = resource.getrlimit(resource.RLIMIT_NPROC)
-    except OSError:
-        return None
-    proposed = owned + MAX_ADDITIONAL_PROCESSES
-    if soft != resource.RLIM_INFINITY:
-        proposed = min(proposed, soft)
-    return proposed if proposed > owned else None
-
-
 class LinuxSandbox(CommandRuntime):
     """Run bounded commands under mandatory Linux namespace and syscall enforcement."""
 
@@ -294,12 +287,9 @@ class LinuxSandbox(CommandRuntime):
         _require_linux()
         self.roots = _validated_roots(profile.roots)
         self.root = self.roots[0].path
-        denied = tuple(dict.fromkeys(Path(os.path.abspath(path)) for path in profile.denied_paths))
-        if any(not any(path.is_relative_to(root.path) for root in self.roots) for path in denied):
-            raise SandboxError("sandbox denied path is outside its declared roots")
         self.profile = SandboxProfile(
             self.roots,
-            denied,
+            _denied_paths_in_roots(profile.denied_paths, self.roots),
             profile.network,
             profile.ipc,
             tuple(dict.fromkeys(profile.tools)),
@@ -331,7 +321,10 @@ class LinuxSandbox(CommandRuntime):
         self.process_label = process_label
         self._bwrap = Path("/usr/bin/bwrap")
         self._python = Path("/usr/bin/python3")
-        self._process_limit = _process_limit()
+        # Linux counts RLIMIT_NPROC per user namespace, so the caller's other processes
+        # do not count. Each command's namespace holds only its supervisor, PID 1, before
+        # the workload; the host's per-user limit still applies above the namespace.
+        self._process_limit = process_limit(1)
 
     def _validate_paths(self) -> None:
         _check_denied_paths(self.profile.denied_paths)
@@ -377,12 +370,9 @@ class LinuxSandbox(CommandRuntime):
 
         for tree in self._runtime_trees:
             bind(tree, tree)
-        for name in ("bin", "sbin", "lib", "lib64"):
-            path = Path("/") / name
+        for path in _MERGED_USR_LINKS:
             if path.is_symlink():
                 argv.extend(["--symlink", os.readlink(path), str(path)])
-            elif path.is_dir():
-                bind(path, path)
         cache = Path("/etc/ld.so.cache")
         if cache.is_file():
             bind(cache, cache)

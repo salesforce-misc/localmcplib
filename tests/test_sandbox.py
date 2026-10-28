@@ -3,6 +3,7 @@ import ctypes
 import json
 import os
 import re
+import resource
 import subprocess
 import tempfile
 from pathlib import Path
@@ -382,11 +383,11 @@ def test_owned_process_limit_handles_platform_results(
 
     monkeypatch.setattr(seatbelt.subprocess, "run", run)
     if mode == "finite":
-        monkeypatch.setattr(seatbelt.resource, "getrlimit", lambda _resource: (12, 12))
+        monkeypatch.setattr(resource, "getrlimit", lambda _resource: (12, 12))
     elif mode == "exhausted":
-        monkeypatch.setattr(seatbelt.resource, "getrlimit", lambda _resource: (2, 2))
+        monkeypatch.setattr(resource, "getrlimit", lambda _resource: (2, 2))
     else:
-        monkeypatch.setattr(seatbelt.resource, "getrlimit", lambda _resource: (seatbelt.resource.RLIM_INFINITY,) * 2)
+        monkeypatch.setattr(resource, "getrlimit", lambda _resource: (resource.RLIM_INFINITY,) * 2)
 
     assert seatbelt._owned_process_limit() == expected
 

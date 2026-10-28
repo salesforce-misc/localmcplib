@@ -6,7 +6,6 @@ import asyncio
 import ctypes
 import json
 import os
-import resource
 import signal
 import subprocess
 import tempfile
@@ -19,7 +18,6 @@ from langchain_core.tools import StructuredTool
 from localmcp.sandbox.base import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MAX_OUTPUT_BYTES,
-    MAX_ADDITIONAL_PROCESSES,
     MAX_OPEN_FILES,
     CommandResult,
     RootAccess,
@@ -38,6 +36,7 @@ from localmcp.sandbox.base import (
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
+    _denied_paths_in_roots,
     _path_ancestors,
     _protected_roots,
     _validated_roots,
@@ -46,6 +45,7 @@ from localmcp.sandbox.runtime import (
     CommandRuntime,
     _OutputLimitExceeded,
     command_environment,
+    process_limit,
     validate_command,
     validate_limits,
 )
@@ -498,11 +498,7 @@ def _owned_process_limit() -> int | None:
     owned = sum(line.strip() == str(os.getuid()) for line in result.stdout.splitlines())
     if owned == 0:
         return None
-    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NPROC)
-    proposed = owned + MAX_ADDITIONAL_PROCESSES
-    if soft_limit != resource.RLIM_INFINITY:
-        proposed = min(proposed, soft_limit)
-    return proposed if proposed > owned else None
+    return process_limit(owned)
 
 
 class MacOSSandbox(CommandRuntime):
@@ -522,16 +518,9 @@ class MacOSSandbox(CommandRuntime):
         validate_limits(timeout_seconds, max_output_bytes, process_label)
         self.roots = _validated_roots(profile.roots)
         self.root = self.roots[0].path
-        denied_paths: list[Path] = []
-        for denied in profile.denied_paths:
-            path = Path(os.path.abspath(denied))
-            if not any(path.is_relative_to(root.path) for root in self.roots):
-                raise SandboxError("sandbox denied path is outside its declared roots")
-            if path not in denied_paths:
-                denied_paths.append(path)
         self.profile = SandboxProfile(
             self.roots,
-            denied_paths=tuple(denied_paths),
+            denied_paths=_denied_paths_in_roots(profile.denied_paths, self.roots),
             network=profile.network,
             ipc=profile.ipc,
             tools=tuple(dict.fromkeys(profile.tools)),

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import resource
 from pathlib import Path
 
-from localmcp.sandbox.base import MAX_COMMAND_CHARACTERS, SandboxError
+from localmcp.sandbox.base import MAX_ADDITIONAL_PROCESSES, MAX_COMMAND_CHARACTERS, SandboxError
 
 
 def validate_limits(timeout_seconds: float, max_output_bytes: int, process_label: str) -> None:
@@ -23,6 +24,19 @@ def validate_command(command: str) -> None:
         raise SandboxError("command must not be blank")
     if "\0" in command or len(command) > MAX_COMMAND_CHARACTERS:
         raise SandboxError(f"command must contain at most {MAX_COMMAND_CHARACTERS} characters and no NUL bytes")
+
+
+def process_limit(existing: int) -> int | None:
+    """Return an RLIMIT_NPROC allowing ``MAX_ADDITIONAL_PROCESSES`` beyond ``existing``.
+
+    ``existing`` is what the kernel already counts against the limit. The result
+    never exceeds the caller's soft limit, and is ``None`` when that leaves no headroom.
+    """
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NPROC)
+    proposed = existing + MAX_ADDITIONAL_PROCESSES
+    if soft_limit != resource.RLIM_INFINITY:
+        proposed = min(proposed, soft_limit)
+    return proposed if proposed > existing else None
 
 
 def command_environment(

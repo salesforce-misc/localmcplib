@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
+import resource
 import signal
 import struct
 import subprocess
@@ -14,6 +16,7 @@ from typing import Any
 import pytest
 
 from localmcp.sandbox import (
+    MAX_ADDITIONAL_PROCESSES,
     MAX_COMMAND_CHARACTERS,
     CommandResult,
     RootAccess,
@@ -34,7 +37,6 @@ def backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> LinuxSandbox:
     root.mkdir()
     monkeypatch.setattr(linux, "_require_linux", lambda: None)
     monkeypatch.setattr(linux, "_RUNTIME_TREES", (runtime,))
-    monkeypatch.setattr(linux, "_process_limit", lambda: None)
     monkeypatch.setattr(linux, "_tool_grants", lambda _: linux._Tools(("cat",), (), (), (), (), ()))
     return LinuxSandbox(SandboxProfile((SandboxRoot(root, RootAccess.READ_WRITE),), tools=("cat",)))
 
@@ -127,6 +129,36 @@ def test_read_only_profile_does_not_gain_writable_scratch(backend: LinuxSandbox,
     assert str(scratch) in profile["readonly_mounts"]
     assert str(scratch) not in profile["write_paths"]
     assert "/dev/shm" in profile["write_paths"]
+
+
+@pytest.mark.parametrize(
+    ("soft", "expected"),
+    [(resource.RLIM_INFINITY, MAX_ADDITIONAL_PROCESSES + 1), (100, 100)],
+    ids=["unlimited", "host-capped"],
+)
+def test_process_limit_counts_only_the_commands_user_namespace(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, soft: int, expected: int
+) -> None:
+    # Linux counts RLIMIT_NPROC per user namespace: the supervisor, then the workload's allowance.
+    monkeypatch.setattr(resource, "getrlimit", lambda _resource: (soft, resource.RLIM_INFINITY))
+    sandbox = LinuxSandbox(backend.profile)
+    _, profile = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+
+    assert profile["process_limit"] == expected
+
+
+def test_split_usr_hosts_are_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    # Tool code is trusted only beneath /usr, so /bin, /sbin, and /lib must link into it.
+    (tmp_path / "usr" / "bin").mkdir(parents=True)
+    linked, separate = tmp_path / "bin", tmp_path / "lib"
+    linked.symlink_to(tmp_path / "usr" / "bin")
+    separate.mkdir()
+    monkeypatch.setattr(linux.sys, "platform", "linux")
+    monkeypatch.setattr(linux, "_MERGED_USR_LINKS", (linked, tmp_path / "lib64"))
+    linux._require_linux()
+    monkeypatch.setattr(linux, "_MERGED_USR_LINKS", (linked, separate))
+    with pytest.raises(SandboxError, match=re.escape(f"merged /usr, but {separate} is a separate directory")):
+        linux._require_linux()
 
 
 @pytest.mark.parametrize("command", [" \t", "bad\0command", "x" * (MAX_COMMAND_CHARACTERS + 1)])

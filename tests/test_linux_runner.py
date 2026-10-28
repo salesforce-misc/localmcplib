@@ -8,6 +8,7 @@ import io
 import json
 import os
 import resource
+import signal
 from types import SimpleNamespace
 from typing import Any
 
@@ -466,6 +467,22 @@ def test_child_setup_failure_never_executes_workload(monkeypatch: pytest.MonkeyP
         runner._child(_profile(), _Libc(), _Policy(), 42)  # type: ignore[arg-type]
     assert events == ["fds", "limits", "landlock"]
     assert output == [b"RuntimeError: Landlock unavailable"]
+
+
+def test_child_restores_default_signals_for_the_workload(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Python ignores SIGPIPE and SIGXFSZ at startup, and execv keeps ignored signals ignored.
+    events: list[object] = []
+    monkeypatch.setattr(runner, "_close_other_fds", lambda _: None)
+    monkeypatch.setattr(runner, "_limits", lambda _: None)
+    monkeypatch.setattr(runner, "_landlock", lambda *_args: None)
+    monkeypatch.setattr(runner, "_seccomp", lambda *_args: None)
+    monkeypatch.setattr(runner, "_write", lambda *_args: None)
+    monkeypatch.setattr(signal, "signal", lambda number, handler: events.append((number, handler)))
+    monkeypatch.setattr(os, "execv", lambda path, _argv: events.append(path))
+
+    runner._child(_profile(), _Libc(), _Policy(), 42)  # type: ignore[arg-type]
+
+    assert events == [(signal.SIGPIPE, signal.SIG_DFL), (signal.SIGXFSZ, signal.SIG_DFL), "/bin/sh"]
 
 
 class _Function:

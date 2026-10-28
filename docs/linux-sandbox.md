@@ -17,7 +17,10 @@ The host must permit unprivileged user namespaces and enable Landlock ABI 3
 or newer. Container environments must also permit the namespace and mount
 operations bubblewrap needs. Presence of the executable alone does not prove
 the host supports sandbox execution: setup is checked on every invocation.
-The initial implementation targets x86-64 and AArch64 glibc systems with system tools under
+The initial implementation targets x86-64 and AArch64 glibc systems with a
+merged `/usr`, where `/bin`, `/sbin`, `/lib`, and `/lib64` are links into
+`/usr`, as on current Debian, Ubuntu, and Fedora releases. Hosts where any of
+them is a separate directory are rejected. System tools are found under
 `/usr/bin`, `/bin`, `/usr/sbin`, and `/sbin`.
 
 ```python
@@ -96,7 +99,10 @@ Seatbelt semantics cannot yet be reproduced:
   workload has no capabilities, including inside its namespace.
 - `network=True` permits outbound IPv4/IPv6 TCP and UDP, with DNS and system
   trust-store reads. It does not permit listeners, raw sockets, or Unix-domain
-  sockets. With networking disabled, socket creation is denied in addition to
+  sockets. Name resolution uses glibc's built-in `files` and `dns` sources,
+  which requires glibc 2.34 or newer. Other NSS modules named in
+  `nsswitch.conf`, such as `resolve` or `mdns`, are not loaded; lookups
+  continue with the next source as `nsswitch.conf` directs. With networking disabled, socket creation is denied in addition to
   network namespace isolation, so private loopback is not an escape hatch.
 - `ipc=True` enables POSIX and SysV shared memory in a private IPC namespace;
   it does not expose host shared-memory objects or enable semaphores, message
@@ -107,10 +113,12 @@ Seatbelt semantics cannot yet be reproduced:
   Utility flags, diagnostics, and GNU/BSD output differences remain platform
   specific.
 
-The CPU, wall-clock, output, and file-descriptor limits follow the macOS
-defaults. The process-count allowance is best effort and per user, as with
-the macOS implementation; it is not a cgroup quota. Filesystem writes are
-not size-limited.
+The CPU, wall-clock, output, file-descriptor, and process-count limits follow
+the macOS defaults. Linux counts processes within each command's private user
+namespace, so a command may run up to 256 processes, including its shell,
+however many the caller already runs; on macOS the allowance is added to the
+caller's current process count. The caller's own per-user limit still applies.
+Neither is a cgroup quota. Filesystem writes are not size-limited.
 
 ## Validation
 

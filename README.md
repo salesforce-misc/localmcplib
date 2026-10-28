@@ -204,8 +204,8 @@ or times out, every process it started is killed, including background and
 detached ones. `create_sandbox(profile)` selects macOS Seatbelt or the Linux
 bubblewrap backend. The package-level `sandbox_tools` uses the same platform
 selection; the existing `seatbelt.sandbox_tools` remains macOS-specific.
-Linux requires bubblewrap, system Python 3, libseccomp, and enabled user
-namespaces and Landlock. See [Linux sandbox support](docs/linux-sandbox.md)
+Linux requires bubblewrap, system Python 3, libseccomp, a merged `/usr`, and
+enabled user namespaces and Landlock. See [Linux sandbox support](docs/linux-sandbox.md)
 for installation, usage, and the remaining semantic differences.
 
 Nothing limits how much a command writes. Its temporary directory is writable
