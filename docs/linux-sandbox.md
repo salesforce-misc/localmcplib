@@ -97,8 +97,10 @@ Seatbelt semantics cannot yet be reproduced:
 - A read-only directory rebuilt to hide a missing denied path is fixed for the
   duration of the command. Entries the host adds while it runs stay hidden, a
   file the host replaces with a new one keeps its earlier contents, and the
-  directory itself reports mode `0755`. It may hold at most 1,024 other entries;
-  beyond that, the command is rejected.
+  directory itself reports mode `0755`. Each such directory may hold at most
+  1,024 other entries; beyond that, the command is rejected. An entry the host
+  replaces while the command is being set up also rejects it, rather than
+  mounting what the replacement names.
 - A script tool requires its shebang interpreter to be explicitly listed in
   the required `tools` list (the shell is always available). Without that grant,
   a required script tool is rejected and an optional one is omitted. This avoids

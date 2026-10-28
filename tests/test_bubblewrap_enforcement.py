@@ -12,9 +12,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -231,6 +232,47 @@ async def test_read_only_denial_created_while_a_command_runs_stays_hidden(worksp
     _denied(result)
     assert result.stdout == ""
     _denied(await sandbox.run(f"cat {secret}"))
+
+
+def _change_after_planning(sandbox: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, change: Callable[[], None]) -> None:
+    """Make the host ``change`` once the command's mounts are planned, before bwrap makes them."""
+    plan = sandbox._invocation
+
+    def planned_then_changed(*args: Any) -> Any:
+        planned = plan(*args)
+        change()
+        return planned
+
+    monkeypatch.setattr(sandbox, "_invocation", planned_then_changed)
+
+
+async def test_rebuilt_entry_replaced_during_setup_fails_closed(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = workspace.readonly / "data"
+    data.write_text("visible")
+    (workspace.outside / "secret").write_text("secret-sentinel")
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(workspace.readonly / "missing",)))
+
+    def replace_with_symlink() -> None:
+        data.unlink()
+        data.symlink_to(workspace.outside / "secret")
+
+    _change_after_planning(sandbox, monkeypatch, replace_with_symlink)
+    with pytest.raises(SandboxError, match="entry changed while the sandbox was being prepared"):
+        await sandbox.run(f"cat {data}")
+
+
+async def test_rebuilt_entry_removed_during_setup_is_left_out(
+    workspace: Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (workspace.readonly / "data").write_text("visible")
+    sandbox = LinuxSandbox(workspace.profile(denied_paths=(workspace.readonly / "missing",)))
+    _change_after_planning(sandbox, monkeypatch, (workspace.readonly / "data").unlink)
+
+    result = await sandbox.run(f"ls -A {workspace.readonly}")
+    assert result.exit_code == 0, result
+    assert result.stdout == ""
 
 
 async def test_denied_fifos_and_sockets_are_covered(workspace: Workspace) -> None:

@@ -257,6 +257,23 @@ def test_mount_failure_prevents_completion(monkeypatch: pytest.MonkeyPatch) -> N
         runner._lock_mounts(_profile(), library)  # type: ignore[arg-type]
 
 
+def test_rebuilt_entries_must_be_the_ones_the_host_listed(tmp_path: Any) -> None:
+    listed, removed = tmp_path / "listed", tmp_path / "removed"
+    listed.write_text("listed")
+    info = os.lstat(listed)
+    # The profile arrives as JSON, so each identity is a list.
+    identities = {str(listed): [info.st_dev, info.st_ino], str(removed): [info.st_dev, info.st_ino + 1]}
+    runner._check_entry_identities({"entry_identities": identities})
+    runner._check_entry_identities({})
+
+    # Create the replacement before swapping it in, so it cannot reuse the listed inode.
+    swap = tmp_path / "swap"
+    swap.symlink_to(tmp_path)
+    swap.replace(listed)
+    with pytest.raises(RuntimeError, match=f"entry changed while the sandbox was being prepared: {listed}"):
+        runner._check_entry_identities({"entry_identities": identities})
+
+
 def test_capabilities_are_removed_before_no_new_privileges(monkeypatch: pytest.MonkeyPatch) -> None:
     library = _Libc()
     runner._drop_capabilities(library)  # type: ignore[arg-type]

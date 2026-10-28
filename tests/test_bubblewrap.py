@@ -10,6 +10,7 @@ import resource
 import signal
 import struct
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -164,6 +165,10 @@ def test_missing_read_only_denials_are_left_out_of_rebuilt_directories(backend: 
         ("--ro-bind", str(control / "deny-file"), str(secret)),
     ]
     assert {str(root), str(root / "nested")} <= set(profile["readonly_mounts"])
+    # Only bound entries are checked again in the sandbox; symlinks and rebuilt directories are not mounted.
+    assert profile["entry_identities"] == {
+        str(path): (path.lstat().st_dev, path.lstat().st_ino) for path in (root / "data", root / "nested" / "kept")
+    }
 
 
 def test_rebuilt_directories_keep_the_access_of_roots_inside_them(backend: LinuxSandbox, tmp_path: Path) -> None:
@@ -194,6 +199,27 @@ def test_rebuilt_directories_keep_the_access_of_roots_inside_them(backend: Linux
     assert str(child) in profile["write_paths"]
 
 
+def test_pinned_ancestors_inside_protected_roots_are_read_only(backend: LinuxSandbox, tmp_path: Path) -> None:
+    protected = backend.root / "docs"
+    secret = protected / "private" / "secret"
+    secret.parent.mkdir(parents=True)
+    secret.touch()
+    sandbox = LinuxSandbox(
+        SandboxProfile(
+            (SandboxRoot(backend.root, RootAccess.READ_WRITE), SandboxRoot(protected)), denied_paths=(secret,)
+        )
+    )
+    control = tmp_path / "control"
+    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
+
+    assert _mounts(argv, backend.root) == [
+        ("--bind", str(backend.root), str(backend.root)),
+        ("--ro-bind", str(protected), str(protected)),
+        ("--ro-bind", str(secret.parent), str(secret.parent)),
+        ("--ro-bind", str(control / "deny-file"), str(secret)),
+    ]
+
+
 def test_missing_writable_denials_are_covered_once_they_exist(backend: LinuxSandbox, tmp_path: Path) -> None:
     secret = backend.root / "config" / "secret"
     sandbox = LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(secret,)))
@@ -222,19 +248,21 @@ def test_missing_denial_beneath_a_file_pins_the_file(backend: LinuxSandbox, tmp_
     assert _mounts(argv, root) == [("--ro-bind", str(root), str(root)), ("--ro-bind", str(blocker), str(blocker))]
 
 
-def test_rebuilt_directories_are_bounded(
+def test_each_rebuilt_directory_is_bounded(
     backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     root = tmp_path / "ro"
-    root.mkdir()
-    (root / "one").touch()
-    (root / "two").touch()
+    first, second = root / "first", root / "second"
+    for directory in (first, second):
+        directory.mkdir(parents=True)
+        (directory / "one").touch()
+        (directory / "two").touch()
     monkeypatch.setattr(linux, "_MAX_REBUILT_ENTRIES", 2)
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "missing",)))
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(first / "missing", second / "missing")))
     sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
 
-    (root / "three").touch()
-    with pytest.raises(SandboxError, match="more than 2 entries"):
+    (second / "three").touch()
+    with pytest.raises(SandboxError, match=f"in {re.escape(str(second))}: it holds more than 2 other entries"):
         sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
 
 
@@ -631,6 +659,35 @@ async def test_invocation_uses_trusted_launcher_snapshot_after_source_changes(
     assert result.exit_code == 0
     assert launched_sources == [linux._RUNNER_SOURCE]
     assert source_reads == []
+
+
+async def test_denial_layout_is_planned_off_the_event_loop(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    readonly = tmp_path / "ro"
+    readonly.mkdir()
+    sandbox = LinuxSandbox(
+        SandboxProfile((*backend.roots, SandboxRoot(readonly)), denied_paths=(readonly / "missing",))
+    )
+    _fake_launch(sandbox, monkeypatch, status={"exit_code": 0})
+    listing, released = threading.Event(), threading.Event()
+    scandir = os.scandir
+
+    def slow_listing(path: Path) -> Any:
+        listing.set()
+        # Only another coroutine can release this, which it cannot do while the loop is blocked.
+        assert released.wait(5), "listing the rebuilt directory blocked the event loop"
+        return scandir(path)
+
+    async def release() -> None:
+        while not listing.is_set():
+            await asyncio.sleep(0.01)
+        released.set()
+
+    monkeypatch.setattr(linux.os, "scandir", slow_listing)
+    result, _ = await asyncio.gather(sandbox.run("true"), release())
+
+    assert result.exit_code == 0
 
 
 @pytest.mark.parametrize("status", [None, {"error": "Landlock unavailable"}, {"exit_code": "wrong-type"}])
