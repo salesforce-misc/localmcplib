@@ -1,23 +1,19 @@
-"""Portable policy and supervision tests for the Linux backend."""
+"""Portable policy, discovery, argv, and supervision tests for the Linux backend."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import re
-import resource
+import pwd
 import signal
-import struct
-import subprocess
-import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from localmcp.sandbox import (
-    MAX_ADDITIONAL_PROCESSES,
     MAX_COMMAND_CHARACTERS,
     CommandResult,
     RootAccess,
@@ -30,560 +26,423 @@ from localmcp.sandbox.bubblewrap import LinuxSandbox
 from localmcp.sandbox.runtime import _OutputLimitExceeded
 
 
+@dataclass
+class Host:
+    path: Path
+    root: Path
+
+    def program(self, name: str, *, directory: Path | None = None) -> Path:
+        program = (directory or self.path / "usr/bin") / name
+        program.parent.mkdir(parents=True, exist_ok=True)
+        program.write_text("#!/bin/sh\nexit 0\n")
+        program.chmod(0o755)
+        return program
+
+    def sandbox(self, **kwargs: Any) -> LinuxSandbox:
+        return LinuxSandbox(SandboxProfile((SandboxRoot(self.root, RootAccess.READ_WRITE),), tools=("cat",), **kwargs))
+
+
 @pytest.fixture
-def backend(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> LinuxSandbox:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    root = tmp_path / "root"
-    root.mkdir()
+def host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Host:
+    host = Host(tmp_path / "host", tmp_path / "root")
+    host.root.mkdir()
+    for directory in ("usr/bin", "usr/lib", "lib", "nix/store", "etc", "home"):
+        (host.path / directory).mkdir(parents=True, exist_ok=True)
+    (host.path / "bin").symlink_to("usr/bin")
+    (host.path / "etc/ld.so.cache").touch()
+    (host.path / "etc/hosts").write_text("127.0.0.1 localhost\n")
+    for program in ("bash", "bwrap", "cat"):
+        host.program(program)
     monkeypatch.setattr(linux, "_require_linux", lambda: None)
-    monkeypatch.setattr(linux, "_RUNTIME_TREES", (runtime,))
-    monkeypatch.setattr(linux, "_tool_grants", lambda _: linux._Tools(("cat",), (), (), (), (), ()))
-    return LinuxSandbox(SandboxProfile((SandboxRoot(root, RootAccess.READ_WRITE),), tools=("cat",)))
+    monkeypatch.setattr(linux, "_BIN_DIRECTORIES", (host.path / "usr/bin", host.path / "bin"))
+    monkeypatch.setattr(linux, "_RUNTIME_TREES", (host.path / "usr", host.path / "nix/store"))
+    monkeypatch.setattr(linux, "_RUNTIME_ALIASES", (host.path / "bin", host.path / "lib"))
+    monkeypatch.setattr(linux, "_ETC_PATHS", (host.path / "etc/ld.so.cache",))
+    monkeypatch.setattr(linux, "_NETWORK_PATHS", (host.path / "etc/hosts",))
+    monkeypatch.setattr(linux, "_NIX_STORE", host.path / "nix/store")
+    monkeypatch.setattr(linux, "_nix_profile_links", lambda: (host.path / "home/.nix-profile",))
+    monkeypatch.setattr(linux, "find_library", lambda profiles: host.path / "lib/libseccomp.so.2")
+    monkeypatch.setattr(linux, "build_filter", lambda *args, **kwargs: b"compiled-filter")
+    monkeypatch.setattr(linux, "owned_process_limit", lambda: 300)
+    monkeypatch.setattr(linux, "limited_command", lambda argv, _timeout, _maximum: argv)
+    return host
 
 
-def test_backend_preserves_first_root_and_nested_protection(backend: LinuxSandbox) -> None:
-    protected = backend.root / "docs" / "source"
+@pytest.fixture
+def backend(host: Host) -> LinuxSandbox:
+    return host.sandbox()
+
+
+def _operations(argv: list[str], option: str, arity: int = 2) -> list[tuple[str, ...]]:
+    return [tuple(argv[index + 1 : index + 1 + arity]) for index, value in enumerate(argv) if value == option]
+
+
+def test_backend_preserves_first_root_and_nested_protection(host: Host) -> None:
+    protected = host.root / "docs/source"
     protected.mkdir(parents=True)
     (protected / "inner").mkdir()
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(backend.root, RootAccess.READ_WRITE), SandboxRoot(protected))))
-
-    assert sandbox.root == backend.root
+    sandbox = LinuxSandbox(
+        SandboxProfile((SandboxRoot(host.root, RootAccess.READ_WRITE), SandboxRoot(protected)), tools=("cat",))
+    )
+    assert sandbox.root == host.root
     assert sandbox._protected_paths == (protected,)
     with pytest.raises(SandboxError, match="write-protected"):
         LinuxSandbox(
             SandboxProfile(
                 (
-                    SandboxRoot(backend.root, RootAccess.READ_WRITE),
+                    SandboxRoot(host.root, RootAccess.READ_WRITE),
                     SandboxRoot(protected),
                     SandboxRoot(protected / "inner", RootAccess.READ_WRITE),
-                )
+                ),
+                tools=("cat",),
             )
         )
 
 
-def test_denied_paths_need_not_exist_but_must_lie_in_roots(backend: LinuxSandbox, tmp_path: Path) -> None:
-    (backend.root / "file").touch()
-    LinuxSandbox(
-        SandboxProfile(backend.roots, denied_paths=(backend.root / "missing" / "deeper", backend.root / "file" / "key"))
-    )
-    outside = tmp_path / "outside"
-    outside.touch()
+def test_denied_paths_need_not_exist_but_must_lie_in_roots(host: Host) -> None:
+    host.sandbox(denied_paths=(host.root / "missing/deeper",))
     with pytest.raises(SandboxError, match="outside"):
-        LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(outside,)))
+        host.sandbox(denied_paths=(host.path / "secret",))
 
 
-def test_denied_symlinks_and_hard_links_fail_closed(backend: LinuxSandbox) -> None:
-    secret = backend.root / "secret"
+def test_denied_symlinks_and_hard_links_fail_closed(host: Host) -> None:
+    secret = host.root / "secret"
     secret.write_text("private")
-    alias = backend.root / "alias"
+    alias = host.root / "alias"
     alias.symlink_to(secret)
     with pytest.raises(SandboxError, match="symlink"):
-        LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(alias,)))
+        host.sandbox(denied_paths=(alias,))
     alias.unlink()
     os.link(secret, alias)
     with pytest.raises(SandboxError, match="hard link"):
-        LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(secret,)))
+        host.sandbox(denied_paths=(secret,))
 
 
-def test_tools_and_runtime_cannot_overlap_roots(backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        linux, "_tool_grants", lambda _: linux._Tools(("cat",), (backend.root / "cat",), (), (), (), ())
-    )
+def test_runtime_cannot_overlap_roots(host: Host) -> None:
     with pytest.raises(SandboxError, match="overlap"):
-        LinuxSandbox(SandboxProfile(backend.roots))
+        LinuxSandbox(SandboxProfile((SandboxRoot(host.path / "usr"),), tools=("cat",)))
 
 
-def test_mount_order_keeps_narrower_protection_and_denials(backend: LinuxSandbox, tmp_path: Path) -> None:
-    ancestor = backend.root / "docs"
-    protected = ancestor / "source"
+def test_mount_order_preserves_protection_denials_and_pinned_ancestors(host: Host, tmp_path: Path) -> None:
+    protected = host.root / "docs/source"
     protected.mkdir(parents=True)
     secret = protected / "secret"
     secret.touch()
     sandbox = LinuxSandbox(
         SandboxProfile(
-            (SandboxRoot(backend.root, RootAccess.READ_WRITE), SandboxRoot(protected)), denied_paths=(secret,)
+            (SandboxRoot(host.root, RootAccess.READ_WRITE), SandboxRoot(protected)),
+            denied_paths=(secret,),
+            tools=("cat",),
         )
     )
-    argv, profile = sandbox._invocation("printf ok", tmp_path / "scratch", tmp_path / "control")
-
-    root_bind = argv.index(str(backend.root))
-    ancestor_bind = argv.index(str(ancestor))
-    protected_bind = argv.index(str(protected))
-    denied_bind = argv.index(str(secret))
-    assert root_bind < ancestor_bind < protected_bind < denied_bind
-    assert str(protected) in profile["readonly_mounts"]
-    assert "--unshare-net" in argv
-    assert "--unshare-user" in argv
-    assert "--unshare-pid" in argv
-    assert "--as-pid-1" in argv
-    assert profile["command"] == "printf ok"
-    assert str(backend.root) in profile["write_paths"]
+    control, scratch = tmp_path / "control", tmp_path / "scratch"
+    argv = sandbox._invocation("printf ok", scratch, control)
+    assert argv.index(str(host.root)) < argv.index(str(host.root / "docs")) < argv.index(str(protected))
+    assert argv.index(str(protected)) < argv.index(str(secret))
+    assert (str(host.root), str(host.root)) in _operations(argv, "--bind")
+    assert (str(protected), str(protected)) in _operations(argv, "--ro-bind")
+    assert (str(control / "deny-file"), str(secret)) in _operations(argv, "--ro-bind")
 
 
-_MOUNT_ARITY = {"--tmpfs": 1, "--symlink": 2, "--bind": 2, "--ro-bind": 2, "--ro-bind-try": 2}
-
-
-def _mounts(argv: list[str], under: Path) -> list[tuple[str, ...]]:
-    """Return the mount operations whose target lies under ``under``, in order."""
-    operations: list[tuple[str, ...]] = []
-    index = 0
-    while index < len(argv):
-        arity = _MOUNT_ARITY.get(argv[index])
-        if arity is None:
-            index += 1
-            continue
-        operation = tuple(argv[index : index + arity + 1])
-        if Path(operation[-1]).is_relative_to(under):
-            operations.append(operation)
-        index += arity + 1
-    return operations
-
-
-def test_missing_read_only_denials_are_left_out_of_rebuilt_directories(backend: LinuxSandbox, tmp_path: Path) -> None:
-    root = tmp_path / "ro"
-    (root / "nested").mkdir(parents=True)
-    (root / "nested" / "kept").touch()
-    (root / "data").touch()
-    (root / "alias").symlink_to(tmp_path / "outside")
-    secret = root / "secret"
-    secret.touch()
-    sandbox = LinuxSandbox(
-        SandboxProfile(
-            (SandboxRoot(root),), denied_paths=(root / "missing", secret, root / "nested" / "absent" / "deeper")
-        )
-    )
-    control = tmp_path / "control"
-    argv, profile = sandbox._invocation("true", tmp_path / "scratch", control)
-
-    assert _mounts(argv, root) == [
-        ("--tmpfs", str(root)),
-        ("--symlink", str(tmp_path / "outside"), str(root / "alias")),
-        ("--ro-bind-try", str(root / "data"), str(root / "data")),
-        ("--tmpfs", str(root / "nested")),
-        ("--ro-bind-try", str(root / "nested" / "kept"), str(root / "nested" / "kept")),
-        ("--ro-bind", str(control / "deny-file"), str(secret)),
-    ]
-    assert {str(root), str(root / "nested")} <= set(profile["readonly_mounts"])
-    # Only bound entries are checked again in the sandbox; symlinks and rebuilt directories are not mounted.
-    assert profile["entry_identities"] == {
-        str(path): (path.lstat().st_dev, path.lstat().st_ino) for path in (root / "data", root / "nested" / "kept")
-    }
-
-
-def test_rebuilt_directories_keep_the_access_of_roots_inside_them(backend: LinuxSandbox, tmp_path: Path) -> None:
-    parent = tmp_path / "ro"
-    child = parent / "child"
-    child.mkdir(parents=True)
-    protected = backend.root / "docs"
-    protected.mkdir()
-    sandbox = LinuxSandbox(
-        SandboxProfile(
-            (
-                SandboxRoot(backend.root, RootAccess.READ_WRITE),
-                SandboxRoot(protected),
-                SandboxRoot(parent),
-                SandboxRoot(child, RootAccess.READ_WRITE),
-            ),
-            denied_paths=(parent / "missing", protected / "missing"),
-        )
-    )
-    argv, profile = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    assert _mounts(argv, parent) == [("--tmpfs", str(parent)), ("--bind", str(child), str(child))]
-    assert _mounts(argv, backend.root) == [
-        ("--bind", str(backend.root), str(backend.root)),
-        ("--tmpfs", str(protected)),
-    ]
-    assert str(protected) in profile["readonly_mounts"]
-    assert str(child) in profile["write_paths"]
-
-
-def test_pinned_ancestors_inside_protected_roots_are_read_only(backend: LinuxSandbox, tmp_path: Path) -> None:
-    protected = backend.root / "docs"
-    secret = protected / "private" / "secret"
-    secret.parent.mkdir(parents=True)
-    secret.touch()
-    sandbox = LinuxSandbox(
-        SandboxProfile(
-            (SandboxRoot(backend.root, RootAccess.READ_WRITE), SandboxRoot(protected)), denied_paths=(secret,)
-        )
-    )
-    control = tmp_path / "control"
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
-
-    assert _mounts(argv, backend.root) == [
-        ("--bind", str(backend.root), str(backend.root)),
-        ("--ro-bind", str(protected), str(protected)),
-        ("--ro-bind", str(secret.parent), str(secret.parent)),
-        ("--ro-bind", str(control / "deny-file"), str(secret)),
+def test_namespace_process_environment_and_shell_arguments(backend: LinuxSandbox, tmp_path: Path) -> None:
+    argv = backend._invocation("printf ok", tmp_path / "scratch", tmp_path / "control")
+    for option in (
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-net",
+        "--unshare-cgroup",
+    ):
+        assert option in argv
+    assert argv[argv.index("--uid") + 1] == str(os.getuid())
+    assert argv[argv.index("--gid") + 1] == str(os.getgid())
+    assert "--die-with-parent" in argv and "--new-session" in argv
+    assert _operations(argv, "--cap-drop", 1) == [("ALL",)]
+    assert "--cap-add" not in argv and "--proc" not in argv and "--as-pid-1" not in argv
+    assert "--clearenv" in argv
+    environment = dict(_operations(argv, "--setenv"))
+    assert environment["HOME"] == "/var/empty" and environment["TMPDIR"] == str(tmp_path / "scratch")
+    assert environment["PATH"].endswith("/usr/bin:/bin:/usr/sbin:/sbin")
+    assert argv[argv.index("--") + 1 :] == [
+        str(backend._shell),
+        "--noprofile",
+        "--norc",
+        "-c",
+        "printf ok",
+        backend.process_label,
     ]
 
 
-def test_missing_writable_denials_are_covered_once_they_exist(backend: LinuxSandbox, tmp_path: Path) -> None:
-    secret = backend.root / "config" / "secret"
-    sandbox = LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(secret,)))
-    control = tmp_path / "control"
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
-
-    assert _mounts(argv, backend.root) == [("--bind", str(backend.root), str(backend.root))]
-    secret.parent.mkdir()
-    secret.touch()
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
-    assert _mounts(argv, backend.root) == [
-        ("--bind", str(backend.root), str(backend.root)),
-        ("--bind", str(secret.parent), str(secret.parent)),
-        ("--ro-bind", str(control / "deny-file"), str(secret)),
-    ]
+def test_runtime_handles_both_merged_and_split_usr(host: Host, tmp_path: Path) -> None:
+    argv = host.sandbox()._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert ("usr/bin", str(host.path / "bin")) in _operations(argv, "--symlink")
+    assert (str(host.path / "lib"), str(host.path / "lib")) in _operations(argv, "--ro-bind")
+    assert (str(host.path / "usr"), str(host.path / "usr")) in _operations(argv, "--ro-bind")
 
 
-def test_missing_denial_beneath_a_file_pins_the_file(backend: LinuxSandbox, tmp_path: Path) -> None:
-    root = tmp_path / "ro"
-    root.mkdir()
-    blocker = root / "blocker"
-    blocker.touch()
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(blocker / "secret",)))
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    assert _mounts(argv, root) == [("--ro-bind", str(root), str(root)), ("--ro-bind", str(blocker), str(blocker))]
-
-
-def test_each_rebuilt_directory_is_bounded(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / "ro"
-    first, second = root / "first", root / "second"
-    for directory in (first, second):
-        directory.mkdir(parents=True)
-        (directory / "one").touch()
-        (directory / "two").touch()
-    monkeypatch.setattr(linux, "_MAX_REBUILT_ENTRIES", 2)
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(first / "missing", second / "missing")))
-    sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    (second / "three").touch()
-    with pytest.raises(SandboxError, match=f"in {re.escape(str(second))}: it holds more than 2 other entries"):
-        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+@pytest.mark.parametrize("network", [False, True])
+def test_network_namespace_and_curated_files_follow_profile(host: Host, tmp_path: Path, network: bool) -> None:
+    argv = host.sandbox(network=network)._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert ("--unshare-net" in argv) is not network
+    paths = {target for _, target in _operations(argv, "--ro-bind")}
+    assert str(host.path / "etc/ld.so.cache") in paths
+    assert (str(host.path / "etc/hosts") in paths) is network
+    assert str(host.path / "etc") not in paths
 
 
-def test_denial_layouts_fail_closed_when_the_host_changes_unexpectedly(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / "ro"
-    root.mkdir()
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "link" / "secret",)))
-    (root / "link").symlink_to(tmp_path)
-    with pytest.raises(SandboxError, match="goes through a symlink"):
-        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    (root / "link").unlink()
-
-    scandir = os.scandir
-
-    def unlistable(path: Path) -> Any:
-        if path == root:
-            raise PermissionError(13, "Permission denied", str(path))
-        return scandir(path)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(linux.os, "scandir", unlistable)
-        with pytest.raises(SandboxError, match="cannot list"):
-            sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    root.rmdir()
-    with pytest.raises(SandboxError, match="root no longer exists"):
-        sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-
-def test_rebuilt_entries_that_change_while_listed_are_left_out(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    root = tmp_path / "ro"
-    root.mkdir()
-    (root / "alias").symlink_to("gone")
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(root),), denied_paths=(root / "missing",)))
-
-    readlink = os.readlink
-
-    def replaced(path: Path) -> str:
-        if path == root / "alias":
-            raise OSError(22, "Invalid argument", str(path))
-        return readlink(path)
-
-    monkeypatch.setattr(linux.os, "readlink", replaced)
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    assert _mounts(argv, root) == [("--tmpfs", str(root))]
-
-
-def test_denied_special_files_are_covered_by_the_placeholder_file(backend: LinuxSandbox, tmp_path: Path) -> None:
-    fifo = backend.root / "fifo"
-    os.mkfifo(fifo)
-    control = tmp_path / "control"
-    sandbox = LinuxSandbox(SandboxProfile(backend.roots, denied_paths=(fifo,)))
-    argv, _ = sandbox._invocation("true", tmp_path / "scratch", control)
-
-    assert _mounts(argv, fifo) == [("--ro-bind", str(control / "deny-file"), str(fifo))]
-
-
-def test_read_only_profile_does_not_gain_writable_scratch(backend: LinuxSandbox, tmp_path: Path) -> None:
-    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(backend.root),), network=True, ipc=True, tools=()))
+@pytest.mark.parametrize("writable", [False, True])
+@pytest.mark.parametrize("ipc", [False, True])
+def test_scratch_and_device_writes_are_explicit(host: Host, tmp_path: Path, writable: bool, ipc: bool) -> None:
+    access = RootAccess.READ_WRITE if writable else RootAccess.READ_ONLY
+    sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(host.root, access),), tools=(), ipc=ipc))
     scratch = tmp_path / "scratch"
-    argv, profile = sandbox._invocation("true", scratch, tmp_path / "control")
+    argv = sandbox._invocation("true", scratch, tmp_path / "control")
+    # Scratch is the host directory itself, so its writes use disk rather than memory.
+    assert (str(scratch), str(scratch)) in _operations(argv, "--bind" if writable else "--ro-bind")
+    assert (str(scratch),) not in _operations(argv, "--tmpfs", 1)
+    readonly = _operations(argv, "--remount-ro", 1)
+    assert ("/",) in readonly and ("/dev",) in readonly
+    assert (("/dev/shm",) in _operations(argv, "--tmpfs", 1)) is ipc
 
-    assert "--unshare-net" not in argv
-    assert profile["ipc"] is True
-    assert str(scratch) in profile["readonly_mounts"]
-    assert str(scratch) not in profile["write_paths"]
-    assert "/dev/shm" in profile["write_paths"]
+
+def test_missing_denial_is_covered_from_next_invocation(host: Host, tmp_path: Path) -> None:
+    secret = host.root / "secret"
+    sandbox = host.sandbox(denied_paths=(secret,))
+    first = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert str(secret) not in first
+    secret.touch()
+    second = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert (str(tmp_path / "control/deny-file"), str(secret)) in _operations(second, "--ro-bind")
+    assert str(host.root) not in {path for (path,) in _operations(second, "--tmpfs", 1)}
+
+
+def test_denied_special_files_use_file_placeholder(host: Host, tmp_path: Path) -> None:
+    fifo = host.root / "fifo"
+    os.mkfifo(fifo)
+    sandbox = host.sandbox(denied_paths=(fifo,))
+    argv = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert (str(tmp_path / "control/deny-file"), str(fifo)) in _operations(argv, "--ro-bind")
+
+
+def test_tool_discovery_ignores_caller_path_and_missing_optional(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
+    planted = host.root / "bin"
+    host.program("planted", directory=planted)
+    monkeypatch.setenv("PATH", str(planted))
+    sandbox = host.sandbox(optional_tools=("planted", "missing"))
+    assert sandbox.tools == ("cat",)
+    with pytest.raises(SandboxError, match="not installed: planted"):
+        LinuxSandbox(SandboxProfile((SandboxRoot(host.root),), tools=("planted",)))
+
+
+def test_required_tool_link_outside_mounted_runtime_fails_closed(host: Host) -> None:
+    outside = host.program("cat", directory=host.path / "opt/bin")
+    tool = host.path / "usr/bin/cat"
+    tool.unlink()
+    tool.symlink_to(outside)
+    with pytest.raises(SandboxError, match="outside.*runtime|runtime.*outside"):
+        host.sandbox()
+
+
+def test_optional_tool_link_outside_mounted_runtime_grants_nothing(host: Host) -> None:
+    outside = host.program("rg", directory=host.path / "opt/bin")
+    (host.path / "usr/bin/rg").symlink_to(outside)
+    assert host.sandbox(optional_tools=("rg",)).tools == ("cat",)
+
+
+def test_shell_link_outside_mounted_runtime_fails_closed(host: Host) -> None:
+    outside = host.program("bash", directory=host.path / "opt/bin")
+    shell = host.path / "usr/bin/bash"
+    shell.unlink()
+    shell.symlink_to(outside)
+    with pytest.raises(SandboxError, match="outside.*runtime|runtime.*outside"):
+        host.sandbox()
+
+
+def test_bwrap_host_launcher_can_resolve_outside_workload_runtime(host: Host, tmp_path: Path) -> None:
+    launcher = host.program("bwrap", directory=host.path / "opt/bin")
+    system_entry = host.path / "usr/bin/bwrap"
+    system_entry.unlink()
+    system_entry.symlink_to(launcher)
+    sandbox = host.sandbox()
+    assert sandbox._bwrap == launcher
+    replacement = host.program("other-bwrap", directory=host.path / "opt/bin")
+    system_entry.unlink()
+    system_entry.symlink_to(replacement)
+    argv = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert argv[0] == str(launcher)
+
+
+@pytest.mark.parametrize("access", [RootAccess.READ_WRITE, RootAccess.READ_ONLY])
+def test_bwrap_host_launcher_cannot_be_inside_a_writable_root(host: Host, access: RootAccess) -> None:
+    launcher = host.program("bwrap", directory=host.path / "opt/bin")
+    system_entry = host.path / "usr/bin/bwrap"
+    system_entry.unlink()
+    system_entry.symlink_to(launcher)
+    profile = SandboxProfile(
+        (SandboxRoot(host.root, RootAccess.READ_WRITE), SandboxRoot(launcher.parent, access)), tools=("cat",)
+    )
+    if access == RootAccess.READ_WRITE:
+        with pytest.raises(SandboxError, match="writable sandbox root overlaps the host bubblewrap launcher"):
+            LinuxSandbox(profile)
+    else:
+        assert LinuxSandbox(profile)._bwrap == launcher
+
+
+def test_tool_link_into_mounted_nix_store_is_granted(host: Host) -> None:
+    actual = host.program("cat", directory=host.path / "nix/store/cat/bin")
+    tool = host.path / "usr/bin/cat"
+    tool.unlink()
+    tool.symlink_to(actual)
+    assert host.sandbox().tools == ("cat",)
+
+
+_DEFAULT_NIX_PROFILE_LINKS = linux._nix_profile_links
+_SYSTEM_NIX_PROFILES = (Path("/nix/var/nix/profiles/default"), Path("/run/current-system/sw"))
+
+
+def _account(name: str, home: str) -> pwd.struct_passwd:
+    return pwd.struct_passwd((name, "x", os.getuid(), os.getgid(), "", home, "/bin/sh"))
+
+
+def test_default_nix_profiles_include_account_profiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: _account("tester", "/home/tester"))
+    assert _DEFAULT_NIX_PROFILE_LINKS() == (
+        Path("/nix/var/nix/profiles/default"),
+        Path("/nix/var/nix/profiles/per-user/tester/profile"),
+        Path("/run/current-system/sw"),
+        Path("/home/tester/.nix-profile"),
+        Path("/home/tester/.local/state/nix/profiles/profile"),
+    )
 
 
 @pytest.mark.parametrize(
-    ("soft", "expected"),
-    [(resource.RLIM_INFINITY, MAX_ADDITIONAL_PROCESSES + 1), (100, 100)],
-    ids=["unlimited", "host-capped"],
+    ("name", "home", "expected"),
+    [
+        ("", "", _SYSTEM_NIX_PROFILES),
+        (
+            "tester",
+            "relative/home",
+            (_SYSTEM_NIX_PROFILES[0], Path("/nix/var/nix/profiles/per-user/tester/profile"), _SYSTEM_NIX_PROFILES[1]),
+        ),
+        (
+            "bad/name",
+            "/home/tester",
+            (
+                *_SYSTEM_NIX_PROFILES,
+                Path("/home/tester/.nix-profile"),
+                Path("/home/tester/.local/state/nix/profiles/profile"),
+            ),
+        ),
+    ],
 )
-def test_process_limit_counts_only_the_commands_user_namespace(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, soft: int, expected: int
+def test_account_nix_profiles_require_usable_account_fields(
+    monkeypatch: pytest.MonkeyPatch, name: str, home: str, expected: tuple[Path, ...]
 ) -> None:
-    # Linux counts RLIMIT_NPROC per user namespace: the supervisor, then the workload's allowance.
-    monkeypatch.setattr(resource, "getrlimit", lambda _resource: (soft, resource.RLIM_INFINITY))
-    sandbox = LinuxSandbox(backend.profile)
-    _, profile = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
-
-    assert profile["process_limit"] == expected
+    monkeypatch.setattr(pwd, "getpwuid", lambda _uid: _account(name, home))
+    assert _DEFAULT_NIX_PROFILE_LINKS() == expected
 
 
-def test_split_usr_hosts_are_rejected(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # Tool code is trusted only beneath /usr, so /bin, /sbin, and /lib must link into it.
-    (tmp_path / "usr" / "bin").mkdir(parents=True)
-    linked, separate = tmp_path / "bin", tmp_path / "lib"
-    linked.symlink_to(tmp_path / "usr" / "bin")
-    separate.mkdir()
-    monkeypatch.setattr(linux.sys, "platform", "linux")
-    monkeypatch.setattr(linux, "_MERGED_USR_LINKS", (linked, tmp_path / "lib64"))
-    linux._require_linux()
-    monkeypatch.setattr(linux, "_MERGED_USR_LINKS", (linked, separate))
-    with pytest.raises(SandboxError, match=re.escape(f"merged /usr, but {separate} is a separate directory")):
-        linux._require_linux()
+def test_sandbox_starts_without_an_account_entry(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(uid: int) -> pwd.struct_passwd:
+        raise KeyError(f"getpwuid(): uid not found: {uid}")
+
+    monkeypatch.setattr(pwd, "getpwuid", missing)
+    monkeypatch.setattr(linux, "_nix_profile_links", _DEFAULT_NIX_PROFILE_LINKS)
+    assert _DEFAULT_NIX_PROFILE_LINKS() == _SYSTEM_NIX_PROFILES
+    assert host.sandbox().tools == ("cat",)
 
 
-@pytest.mark.parametrize("command", [" \t", "bad\0command", "x" * (MAX_COMMAND_CHARACTERS + 1)])
-async def test_run_rejects_invalid_commands_before_launch(backend: LinuxSandbox, command: str) -> None:
-    with pytest.raises(SandboxError):
-        await backend.run(command)
-
-
-async def test_missing_runtime_fails_closed(backend: LinuxSandbox) -> None:
-    backend._bwrap = backend.root / "missing-bwrap"
-    with pytest.raises(SandboxError, match="requires"):
-        await backend.run("true")
-
-
-@pytest.fixture
-def tool_system(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
-    system = tmp_path / "system"
-    system.mkdir()
-    monkeypatch.setattr(linux, "_BIN_DIRECTORIES", (system,))
-    monkeypatch.setattr(linux, "_trusted_program", lambda path: path.resolve(strict=True))
-    monkeypatch.setattr(linux, "_libraries", lambda _: ())
-    monkeypatch.setattr(linux, "_elf_interpreter", lambda _: None)
-    return system
-
-
-def test_tool_discovery_ignores_caller_path_and_skips_missing_optional(
-    tool_system: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_legacy_per_user_profile_is_resolved_and_recreated(
+    host: Host, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    (tool_system / "cat").touch(mode=0o755)
-    decoy = tmp_path / "decoy"
-    decoy.mkdir()
-    (decoy / "missing").touch(mode=0o755)
-    monkeypatch.setenv("PATH", str(decoy))
+    profile = host.path / "nix/var/nix/profiles/per-user/tester/profile"
+    profile.parent.mkdir(parents=True)
+    store = host.path / "nix/store/legacy-profile"
+    host.program("rg", directory=store / "bin")
+    generation = profile.with_name("profile-1-link")
+    generation.symlink_to(store)
+    profile.symlink_to(generation.name)
+    monkeypatch.setattr(linux, "_nix_profile_links", lambda: (profile,))
+    sandbox = host.sandbox(optional_tools=("rg",))
+    assert sandbox.tools == ("cat", "rg")
+    argv = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert (str(store), str(profile)) in _operations(argv, "--symlink")
+    assert dict(_operations(argv, "--setenv"))["PATH"].startswith(f"{store / 'bin'}:")
 
-    grants = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("cat",), optional_tools=("missing",)))
 
-    assert grants.names == ("cat",)
-    assert (tool_system / "cat") in grants.executables
-    assert (decoy / "missing") not in grants.executables
-    with pytest.raises(SandboxError, match="not installed: missing"):
-        linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("missing",)))
-
-
-def test_optional_tool_helper_failure_grants_no_partial_authority(
-    tool_system: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_nix_profile_paths_are_resolved_once_and_recreated(
+    host: Host, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    good, broken = tool_system / "good", tool_system / "broken"
-    for program in (good, broken):
-        program.touch(mode=0o755)
-    helpers = tmp_path / "helpers"
-    helpers.mkdir()
-    helper = helpers / "helper"
-    helper.touch(mode=0o755)
-    good_library, broken_library = tmp_path / "good.so", tmp_path / "broken.so"
-    monkeypatch.setattr(linux, "_helpers", lambda name: (helpers,) if name == "broken" else ())
-
-    def libraries(program: Path) -> tuple[Path, ...]:
-        if program == helper:
-            raise SandboxError("broken helper dependency")
-        if program == good:
-            return (good_library,)
-        if program == broken:
-            return (broken_library,)
-        return ()
-
-    monkeypatch.setattr(linux, "_libraries", libraries)
-    grants = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("good",), optional_tools=("broken",)))
-    assert grants.names == ("good",)
-    assert grants.executables == (Path("/bin/sh").resolve(), good)
-    assert grants.helpers == ()
-    assert grants.maps == (good_library,)
-    assert grants.data == ()
-    assert grants.aliases == ()
-    with pytest.raises(SandboxError, match="broken helper dependency"):
-        linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("broken",)))
+    profile = host.path / "home/.nix-profile"
+    store = host.path / "nix/store/profile-one"
+    bin_directory = store / "bin"
+    host.program("rg", directory=bin_directory)
+    host.program("cat", directory=bin_directory)
+    profile.symlink_to(store)
+    sandbox = host.sandbox(optional_tools=("rg", "missing"))
+    assert sandbox.tools == ("cat", "rg")
+    assert sandbox._bin_directories == (bin_directory,)
+    argv = sandbox._invocation("true", tmp_path / "scratch", tmp_path / "control")
+    assert (str(store), str(profile)) in _operations(argv, "--symlink")
+    assert dict(_operations(argv, "--setenv"))["PATH"].startswith(f"{bin_directory}:")
+    assert sandbox._bwrap == host.path / "usr/bin/bwrap"
+    profile.unlink()
+    profile.symlink_to(host.root)
+    assert sandbox._bin_directories == (bin_directory,)
 
 
-def test_helper_symlinks_out_of_the_runtime_are_not_scanned(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    # Distro package trees link data out of the runtime, such as Babel's locale data under /usr/share.
-    system, helpers, share = tmp_path / "system", tmp_path / "lib" / "tool", tmp_path / "share"
-    for directory in (system, helpers, share):
-        directory.mkdir(parents=True)
-    (system / "tool").touch(mode=0o755)
-    helper = helpers / "helper"
-    helper.touch(mode=0o755)
-    data = share / "global.dat"
-    data.touch(mode=0o755)
-    (helpers / "global.dat").symlink_to(data)
-    library = tmp_path / "helper.so"
-    monkeypatch.setattr(linux, "_BIN_DIRECTORIES", (system,))
-    monkeypatch.setattr(linux, "_RUNTIME_TREES", (system, helpers.parent, Path("/bin/sh").resolve().parent))
-    monkeypatch.setattr(linux, "_helpers", lambda name: (helpers,) if name == "tool" else ())
-    monkeypatch.setattr(linux, "_libraries", lambda program: (library,) if program == helper else ())
-    monkeypatch.setattr(linux, "_elf_interpreter", lambda _: None)
-
-    grants = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("tool",)))
-
-    assert grants.names == ("tool",)
-    assert grants.helpers == (helpers,)
-    assert grants.maps == (library,)
-    assert data not in grants.executables
+def test_nix_supplies_bwrap_and_bash_when_system_lacks_them(host: Host) -> None:
+    for name in ("bwrap", "bash"):
+        (host.path / "usr/bin" / name).unlink()
+    store = host.path / "nix/store/profile"
+    for name in ("bwrap", "bash"):
+        host.program(name, directory=store / "bin")
+    (host.path / "home/.nix-profile").symlink_to(store)
+    sandbox = host.sandbox()
+    assert sandbox._bwrap == store / "bin/bwrap"
+    assert sandbox._shell == store / "bin/bash"
 
 
-def test_script_tools_need_explicit_interpreter(tool_system: Path, tmp_path: Path) -> None:
-    interpreter = tool_system / "interpreter"
-    interpreter.touch(mode=0o755)
-    script = tool_system / "script"
-    script.write_text(f"#!{interpreter}\n")
-    script.chmod(0o755)
-    with pytest.raises(SandboxError, match="interpreter.*explicitly listed"):
-        linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("script",)))
-    grants = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("script", "interpreter")))
-    assert grants.names == ("script", "interpreter")
-    optional = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=(), optional_tools=("script",)))
-    assert optional.names == ()
-    assert script not in optional.executables
+def test_nix_profile_outside_store_is_ignored(host: Host) -> None:
+    host.program("rg", directory=host.root / "bin")
+    (host.path / "home/.nix-profile").symlink_to(host.root)
+    assert host.sandbox(optional_tools=("rg",)).tools == ("cat",)
 
 
-def test_multicall_aliases_are_rejected(tool_system: Path, tmp_path: Path) -> None:
-    (tool_system / "busybox").touch(mode=0o755)
-    (tool_system / "cat").symlink_to(tool_system / "busybox")
-    with pytest.raises(SandboxError, match="multicall"):
-        linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("cat",)))
+def test_root_cannot_cover_recreated_nix_profile_link(host: Host) -> None:
+    store = host.path / "nix/store/profile"
+    host.program("cat", directory=store / "bin")
+    (host.path / "home/.nix-profile").symlink_to(store)
+    with pytest.raises(SandboxError, match="overlap"):
+        LinuxSandbox(SandboxProfile((SandboxRoot(host.path / "home"),), tools=("cat",)))
 
 
-def test_multicall_hard_links_are_rejected_or_skipped_when_optional(tool_system: Path, tmp_path: Path) -> None:
-    provider = tool_system / "busybox"
-    provider.touch(mode=0o755)
-    alias = tool_system / "cat"
-    os.link(provider, alias)
-    assert alias.resolve().name == "cat"
+def test_filter_is_built_once_per_sandbox_with_profile_flags(host: Host, monkeypatch: pytest.MonkeyPatch) -> None:
+    builds: list[tuple[Path, bool, bool]] = []
 
-    with pytest.raises(SandboxError, match="multicall"):
-        linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=("cat",)))
-    optional = linux._tool_grants(SandboxProfile((SandboxRoot(tmp_path),), tools=(), optional_tools=("cat",)))
-    assert optional.names == ()
-    assert alias not in optional.executables
-    assert provider not in optional.executables
+    def build(library: Path, *, network: bool, ipc: bool) -> bytes:
+        builds.append((library, network, ipc))
+        return b"filter"
+
+    monkeypatch.setattr(linux, "build_filter", build)
+    sandbox = host.sandbox(network=True, ipc=True)
+    assert sandbox._seccomp_filter == b"filter"
+    assert builds == [(host.path / "lib/libseccomp.so.2", True, True)]
 
 
-def test_tool_code_outside_runtime_is_not_trusted(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    untrusted = tmp_path / "workload"
-    untrusted.touch(mode=0o755)
-    (runtime / "tool").symlink_to(untrusted)
-    monkeypatch.setattr(linux, "_RUNTIME_TREES", (runtime,))
-    with pytest.raises(SandboxError, match="outside the system runtime"):
-        linux._trusted_program(runtime / "tool")
-
-
-@pytest.mark.parametrize(("wide", "endian"), [(False, "<"), (False, ">"), (True, "<"), (True, ">")])
-def test_elf_interpreter_is_read_from_program_headers(tmp_path: Path, wide: bool, endian: str) -> None:
-    interpreter = tmp_path / "loader"
-    interpreter.touch()
-    value = os.fsencode(interpreter) + b"\0"
-    header = bytearray(64)
-    header[:6] = b"\x7fELF" + bytes((2 if wide else 1, 1 if endian == "<" else 2))
-    struct.pack_into(endian + ("Q" if wide else "I"), header, 32 if wide else 28, 64)
-    size = 56 if wide else 32
-    struct.pack_into(endian + "HH", header, 54 if wide else 42, size, 1)
-    entry = bytearray(size)
-    struct.pack_into(endian + "I", entry, 0, 3)
-    struct.pack_into(endian + ("Q" if wide else "I"), entry, 8 if wide else 4, 64 + size)
-    struct.pack_into(endian + ("Q" if wide else "I"), entry, 32 if wide else 16, len(value))
-    program = tmp_path / "program"
-    program.write_bytes(header + entry + value)
-
-    assert linux._elf_interpreter(program) == interpreter
-
-
-@pytest.mark.parametrize("content", [b"\x7fELF", b"\x7fELF\x03\x01" + bytes(58)])
-def test_invalid_elf_headers_fail_closed(tmp_path: Path, content: bytes) -> None:
-    program = tmp_path / "program"
-    program.write_bytes(content)
-    with pytest.raises(SandboxError, match="unsupported ELF"):
-        linux._elf_interpreter(program)
-
-
-def test_library_discovery_uses_clean_environment_and_resolves_dependencies(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    library = tmp_path / "libc.so"
-    loader = tmp_path / "loader.so"
-    for path in (library, loader):
-        path.touch()
-    monkeypatch.setattr(linux, "_trusted_program", lambda path: path)
-    monkeypatch.setattr(linux, "_elf_interpreter", lambda _: loader)
-    captured: dict[str, Any] = {}
-
-    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0, f"libc => {library} (0x1)\n{loader} (0x2)\n", "")
-
-    monkeypatch.setattr(subprocess, "run", run)
-    assert linux._libraries(tmp_path / "program") == (library, loader)
-    assert captured["env"] == {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
-    assert captured["timeout"] == 5
-
-
-@pytest.mark.parametrize(("returncode", "output"), [(1, ""), (0, "libc => not found"), (0, "unexpected output")])
-def test_unresolved_libraries_fail_closed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, output: str
-) -> None:
-    monkeypatch.setattr(linux, "_trusted_program", lambda path: path)
-    monkeypatch.setattr(linux, "_elf_interpreter", lambda path: path)
-    monkeypatch.setattr(
-        subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args, returncode, output)
-    )
-    with pytest.raises(SandboxError, match="cannot resolve"):
-        linux._libraries(tmp_path / "program")
+@pytest.mark.parametrize("name", ["bash", "bwrap"])
+def test_missing_backend_dependency_fails_closed(host: Host, name: str) -> None:
+    (host.path / "usr/bin" / name).unlink()
+    with pytest.raises(SandboxError, match="requires bubblewrap and bash"):
+        host.sandbox()
 
 
 class _Process:
     pid = 12345
-    returncode: int | None = 0
 
-    def __init__(self) -> None:
+    def __init__(self, returncode: int | None = 0) -> None:
+        self.returncode = returncode
         self.communicated = False
 
     async def communicate(self) -> tuple[bytes, bytes]:
@@ -592,21 +451,22 @@ class _Process:
 
 
 def _fake_launch(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, *, status: dict[str, object] | None
+    backend: LinuxSandbox,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: str = '{"child-pid": 4321}\n{"exit-code": 7}\n',
+    returncode: int = 7,
 ) -> tuple[_Process, dict[str, Any]]:
-    binary = backend.root / "fake-runtime"
-    binary.touch()
-    backend._bwrap = binary
-    backend._python = binary
-    process = _Process()
+    process = _Process(returncode)
     captured: dict[str, Any] = {}
 
     async def create(*argv: str, **kwargs: Any) -> _Process:
         captured["argv"] = argv
         captured.update(kwargs)
-        status_path = Path(argv[argv.index("/localmcp/status") - 1])
-        if status is not None:
-            status_path.write_text(json.dumps(status))
+        status_fd = int(argv[argv.index("--json-status-fd") + 1])
+        os.write(status_fd, status.encode())
+        seccomp_fd = int(argv[argv.index("--seccomp") + 1])
+        captured["filter"] = os.read(seccomp_fd, 1000)
         return process
 
     async def read(_process: Any, stdout: bytearray, stderr: bytearray) -> None:
@@ -618,92 +478,123 @@ def _fake_launch(
     return process, captured
 
 
-async def test_success_uses_supervised_exit_and_removes_scratch(
+async def test_success_uses_bwrap_exit_and_removes_scratch(
     backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, captured = _fake_launch(backend, monkeypatch, status={"exit_code": 7})
+    _, captured = _fake_launch(backend, monkeypatch)
     result = await backend.run("exit 7")
-
     assert result == CommandResult(exit_code=7, stdout="out\ufffd", stderr="warning")
+    assert captured["filter"] == b"compiled-filter"
     assert captured["env"]["HOME"] == "/var/empty"
     assert captured["stdin"] == asyncio.subprocess.DEVNULL
+    assert "preexec_fn" not in captured
+    assert len(captured["pass_fds"]) == 3
     assert not Path(captured["env"]["TMPDIR"]).exists()
-    assert not Path(captured["argv"][captured["argv"].index("/localmcp/status") - 1]).exists()
 
 
-async def test_invocation_uses_trusted_launcher_snapshot_after_source_changes(
+async def test_each_invocation_recounts_host_tasks_and_hands_limits_to_host_wrapper(
+    host: Host, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    counts: list[int] = []
+    ceilings = iter((300, 450))
+
+    def count() -> int:
+        ceiling = next(ceilings)
+        counts.append(ceiling)
+        return ceiling
+
+    monkeypatch.setattr(linux, "owned_process_limit", count)
+    sandbox = host.sandbox()
+    assert counts == [], "construction must not snapshot a long-lived sandbox's process allowance"
+    handed_limits: list[tuple[float, int | None]] = []
+
+    def limited(argv: list[str], timeout: float, maximum: int | None) -> list[str]:
+        handed_limits.append((timeout, maximum))
+        return ["host-limit-wrapper", *argv]
+
+    monkeypatch.setattr(linux, "limited_command", limited)
+    _, captured = _fake_launch(sandbox, monkeypatch)
+    for _ in range(2):
+        result = await sandbox.run("exit 7")
+        assert result.exit_code == 7
+        assert captured["argv"][0] == "host-limit-wrapper"
+        assert captured["argv"][1] == str(sandbox._bwrap)
+        assert "preexec_fn" not in captured
+    assert counts == [300, 450]
+    assert handed_limits == [(sandbox.timeout_seconds, 300), (sandbox.timeout_seconds, 450)]
+
+
+async def test_concurrent_runs_receive_independent_filter_descriptors(
     backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _fake_launch(backend, monkeypatch, status={"exit_code": 0})
-    launch = asyncio.create_subprocess_exec
-    read_bytes = Path.read_bytes
-    source_reads: list[Path] = []
-    launched_sources: list[bytes] = []
+    filter_descriptors: list[int] = []
+    filters: list[bytes] = []
+    both_started = asyncio.Event()
 
-    def changed_source(path: Path) -> bytes:
-        if path.name == "_linux_runner.py":
-            source_reads.append(path)
-            raise AssertionError("workload replaced the editable launcher source")
-        return read_bytes(path)
+    async def create(*argv: str, **kwargs: Any) -> _Process:
+        descriptor = int(argv[argv.index("--seccomp") + 1])
+        filter_descriptors.append(descriptor)
+        filters.append(os.read(descriptor, 1000))
+        os.write(int(argv[argv.index("--json-status-fd") + 1]), b'{"exit-code": 0}\n')
+        if len(filters) == 2:
+            both_started.set()
+        return _Process()
 
-    async def create(*argv: str, **kwargs: Any) -> Any:
-        runner_path = Path(argv[argv.index("/localmcp/runner.py") - 1])
-        launched_sources.append(runner_path.read_bytes())
-        return await launch(*argv, **kwargs)
+    async def read(*args: Any) -> None:
+        await asyncio.wait_for(both_started.wait(), 5)
 
-    monkeypatch.setattr(Path, "read_bytes", changed_source)
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
-
-    result = await backend.run("true")
-
-    assert result.exit_code == 0
-    assert launched_sources == [linux._RUNNER_SOURCE]
-    assert source_reads == []
-
-
-async def test_denial_layout_is_planned_off_the_event_loop(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    readonly = tmp_path / "ro"
-    readonly.mkdir()
-    sandbox = LinuxSandbox(
-        SandboxProfile((*backend.roots, SandboxRoot(readonly)), denied_paths=(readonly / "missing",))
-    )
-    _fake_launch(sandbox, monkeypatch, status={"exit_code": 0})
-    listing, released = threading.Event(), threading.Event()
-    scandir = os.scandir
-
-    def slow_listing(path: Path) -> Any:
-        listing.set()
-        # Only another coroutine can release this, which it cannot do while the loop is blocked.
-        assert released.wait(5), "listing the rebuilt directory blocked the event loop"
-        return scandir(path)
-
-    async def release() -> None:
-        while not listing.is_set():
-            await asyncio.sleep(0.01)
-        released.set()
-
-    monkeypatch.setattr(linux.os, "scandir", slow_listing)
-    result, _ = await asyncio.gather(sandbox.run("true"), release())
-
-    assert result.exit_code == 0
+    monkeypatch.setattr(backend, "_read_output", read)
+    results = await asyncio.gather(backend.run("true"), backend.run("true"))
+    assert len(set(filter_descriptors)) == 2
+    assert filters == [b"compiled-filter", b"compiled-filter"]
+    assert results == [CommandResult(exit_code=0, stdout="", stderr="")] * 2
 
 
-@pytest.mark.parametrize("status", [None, {"error": "Landlock unavailable"}, {"exit_code": "wrong-type"}])
-async def test_setup_failures_are_not_workload_exit_codes(
-    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, status: dict[str, object] | None
+@pytest.mark.parametrize(
+    "status", ["", '{"child-pid": 4321}\n', '{"exit-code": "7"}\n', '{"exit-code": 0}\n', "invalid"]
+)
+async def test_setup_or_status_failure_is_not_a_workload_exit(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, status: str
 ) -> None:
     _fake_launch(backend, monkeypatch, status=status)
     with pytest.raises(SandboxError, match="setup"):
         await backend.run("true")
 
 
+async def test_spawn_failure_raises_sandbox_error(backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fail(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("cannot create namespace")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fail)
+    with pytest.raises(SandboxError, match="cannot start Linux sandbox"):
+        await backend.run("true")
+
+
+async def test_command_check_runs_before_spawn_or_path_revalidation(
+    backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def unexpected(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("rejected command reached backend launch")
+
+    monkeypatch.setattr(backend, "_validate_paths", unexpected)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected)
+    result = await backend.run("printf ran; ls")
+    assert result.exit_code == 126 and result.stdout == ""
+    assert result.stderr.startswith("localmcp:")
+
+
+@pytest.mark.parametrize("command", ["", "\0", "x" * (MAX_COMMAND_CHARACTERS + 1)])
+async def test_command_validation_preserves_existing_error_api(backend: LinuxSandbox, command: str) -> None:
+    with pytest.raises(SandboxError):
+        await backend.run(command)
+
+
 @pytest.mark.parametrize("failure", [TimeoutError(), _OutputLimitExceeded(), asyncio.CancelledError()])
 async def test_limits_and_cancellation_terminate_before_cleanup(
     backend: LinuxSandbox, monkeypatch: pytest.MonkeyPatch, failure: BaseException
 ) -> None:
-    process, captured = _fake_launch(backend, monkeypatch, status=None)
+    process, captured = _fake_launch(backend, monkeypatch, status="")
     killed: list[_Process] = []
 
     async def read(_process: Any, stdout: bytearray, stderr: bytearray) -> None:
@@ -721,24 +612,20 @@ async def test_limits_and_cancellation_terminate_before_cleanup(
             await backend.run("true")
     else:
         result = await backend.run("true")
-        assert result.exit_code == -1
-        assert result.stdout == "partial"
+        assert result.exit_code == -1 and result.stdout == "partial"
         assert result.timed_out is isinstance(failure, TimeoutError)
         assert result.truncated is isinstance(failure, _OutputLimitExceeded)
     assert killed == [process]
     assert not Path(captured["env"]["TMPDIR"]).exists()
 
 
-async def test_kill_targets_namespace_init_and_waits(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    process = _Process()
-    process.returncode = None
+async def test_kill_targets_namespace_init_then_process_group(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    process = _Process(None)
     info = tmp_path / "info"
-    info.write_text('{"child-pid": 56789}')
+    info.write_text(json.dumps({"child-pid": 56789}))
     signals: list[tuple[str, int, int]] = []
     monkeypatch.setattr(os, "kill", lambda pid, value: signals.append(("pid", pid, value)))
     monkeypatch.setattr(os, "killpg", lambda pid, value: signals.append(("group", pid, value)))
-
     await LinuxSandbox._kill(process, info)  # type: ignore[arg-type]
-
     assert signals == [("pid", 56789, signal.SIGKILL), ("group", process.pid, signal.SIGKILL)]
     assert process.communicated

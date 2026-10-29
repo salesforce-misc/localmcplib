@@ -33,6 +33,7 @@ from localmcp.sandbox.base import (
 from localmcp.sandbox.base import (
     SandboxRoot as SandboxRoot,
 )
+from localmcp.sandbox.command_policy import rejected_command
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
@@ -45,6 +46,7 @@ from localmcp.sandbox.runtime import (
     CommandRuntime,
     _OutputLimitExceeded,
     command_environment,
+    command_exit_code,
     process_limit,
     validate_command,
     validate_limits,
@@ -251,8 +253,8 @@ class _ToolGrants:
 _SHIM_DIRECTORY = Path("/usr/bin")
 # Every shim hands off to the selected install through this libxcselect function.
 _SHIM_MARKER = b"_xcselect_invoke_xcrun"
-# /bin/sh runs the shell selected here, bash by default, in its place.
-_SHELL = Path("/bin/sh")
+# Pin the checked command's interpreter; /bin/sh remains available for script tools.
+_SHELL = Path("/bin/bash")
 _SHELL_SELECTION = Path("/private/var/select/sh")
 
 
@@ -261,7 +263,7 @@ def _shell_executables() -> tuple[Path, ...]:
         selected = _SHELL_SELECTION.resolve(strict=True)
     except OSError:
         selected = Path("/bin/bash")
-    return tuple(dict.fromkeys((_SHELL, selected)))
+    return tuple(dict.fromkeys((_SHELL, Path("/bin/sh"), selected)))
 
 
 def _interpreter(program: Path) -> Path | None:
@@ -579,6 +581,8 @@ class MacOSSandbox(CommandRuntime):
 
     async def run(self, command: str) -> CommandResult:
         validate_command(command)
+        if (rejected := rejected_command(command, self.tools)) is not None:
+            return rejected
         limits = [
             f"ulimit -t {max(1, int(self.timeout_seconds))}",
             f"ulimit -n {MAX_OPEN_FILES}",
@@ -589,7 +593,7 @@ class MacOSSandbox(CommandRuntime):
             [
                 os.fspath(self._shell),
                 "-c",
-                f'{" && ".join(limits)} && exec /bin/sh -c "$1"',
+                f'{" && ".join(limits)} && exec /bin/bash --noprofile --norc -c "$1"',
                 self.process_label,
                 command,
             ],
@@ -686,7 +690,7 @@ class MacOSSandbox(CommandRuntime):
             await self._kill(process, scratch)
             raise
         return CommandResult(
-            exit_code=process.returncode or 0,
+            exit_code=command_exit_code(process.returncode or 0),
             stdout=stdout.decode(errors="replace"),
             stderr=stderr.decode(errors="replace"),
         )
@@ -763,12 +767,11 @@ class MacOSSandbox(CommandRuntime):
         return runtime_profile
 
     def _environment(self, scratch: Path) -> dict[str, str]:
-        environment: dict[str, str] = {}
-        if self._developer is not None:
-            # Pin the selected install and keep shim caches in this invocation's scratch.
-            environment["DEVELOPER_DIR"] = os.fspath(self._developer)
-            environment["xcrun_db"] = os.fspath(scratch / "xcrun_db")
-        return command_environment(scratch, bin_directories=self._toolchain_bin_directories, extra=environment)
+        return command_environment(
+            scratch,
+            bin_directories=self._toolchain_bin_directories,
+            developer_directory=self._developer,
+        )
 
     @staticmethod
     async def _kill(process: asyncio.subprocess.Process, scratch: Path) -> None:

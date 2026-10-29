@@ -77,14 +77,17 @@ class SandboxProfile:
     a read-write root is write-protected there: it stays readable, but nothing
     in it can be written, created, renamed, removed, or linked to a new name.
     ``denied_paths`` are hidden from commands; each must lie inside a root but
-    need not exist, and one created later is hidden too. ``ipc`` permits
+    need not exist; on Linux a newly created path is hidden from the next
+    command onward. ``ipc`` permits
     shared-memory IPC only, not sockets or platform service protocols.
-    ``tools`` lists every command that commands may run besides shell
-    builtins, such as ``(*INSPECTION_TOOLS, "git")``, and defaults to
-    ``INSPECTION_TOOLS``. The backend lets only these run, grants read-only
-    access to only what each one needs, and rejects tools that are not
-    installed. ``optional_tools`` are granted the same way when they are
-    installed; one that is not grants nothing instead of failing.
+    ``tools`` lists the literal command names accepted by the shared Bash
+    check, besides a small set of supported builtins, and defaults to
+    ``INSPECTION_TOOLS``. Required tools must be installed. ``optional_tools``
+    adds installed commands without failing for missing ones. This check
+    includes nested command substitutions but does not inspect programs
+    interpreted or launched by a granted tool. macOS additionally restricts
+    executable access; Linux exposes the system and Nix runtime read-only
+    and permits granted tools to launch other programs within the sandbox.
     """
 
     roots: tuple[SandboxRoot, ...]
@@ -108,7 +111,10 @@ class SandboxProfile:
 
 
 class CommandResult(BaseModel):
-    """Captured result of one bounded command invocation."""
+    """Captured result: a shell exit status (128 + signal), or -1 when bounded.
+
+    ``timed_out`` and ``truncated`` distinguish the two bounded-abort cases.
+    """
 
     exit_code: int
     stdout: str

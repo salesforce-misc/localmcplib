@@ -546,14 +546,14 @@ def listening_port() -> Iterator[int]:
 
 @pytest.mark.skipif(not Path(_NC).is_file(), reason="/usr/bin/nc unavailable")
 async def test_outbound_connection_denied_without_network(workspace: Workspace, listening_port: int) -> None:
-    result = await _run(workspace.profile(network=False, tools=("nc",)), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
+    result = await _run(workspace.profile(network=False, tools=("nc",)), f"nc -n -z -w 2 127.0.0.1 {listening_port}")
 
     _assert_denied(result)
 
 
 @pytest.mark.skipif(not Path(_NC).is_file(), reason="/usr/bin/nc unavailable")
 async def test_outbound_connection_allowed_with_network(workspace: Workspace, listening_port: int) -> None:
-    result = await _run(workspace.profile(network=True, tools=("nc",)), f"{_NC} -n -z -w 2 127.0.0.1 {listening_port}")
+    result = await _run(workspace.profile(network=True, tools=("nc",)), f"nc -n -z -w 2 127.0.0.1 {listening_port}")
 
     assert result.exit_code == 0, result
 
@@ -670,9 +670,10 @@ async def test_only_builtins_and_listed_tools_run(workspace: Workspace) -> None:
 
     result = await _run(workspace.profile(tools=("cat",)), "cat data.txt && echo builtin && ls; echo $?")
 
-    assert result.exit_code == 0, result
-    assert result.stdout == "listed\nbuiltin\n126\n"
-    assert "/bin/ls: Operation not permitted" in result.stderr
+    assert result.exit_code == 126, result
+    assert result.stdout == ""
+    assert result.stderr.startswith("localmcp: ")
+    assert "ls" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -693,12 +694,15 @@ async def test_listed_tools_cannot_run_unlisted_commands(workspace: Workspace, c
 @pytest.mark.parametrize(
     "command",
     [
-        pytest.param("cp /bin/ls copy && ./copy /", id="copied-binary"),
-        pytest.param("printf '#!/bin/sh\\necho ran\\n' > script && chmod +x script && ./script", id="written-script"),
+        pytest.param("cp /bin/ls copy && printf / | xargs ./copy", id="copied-binary"),
+        pytest.param(
+            "printf '#!/bin/sh\\necho ran\\n' > script && chmod +x script && printf x | xargs ./script",
+            id="written-script",
+        ),
     ],
 )
 async def test_programs_in_a_read_write_root_cannot_run(workspace: Workspace, command: str) -> None:
-    result = await _run(workspace.profile(tools=("chmod", "cp")), command)
+    result = await _run(workspace.profile(tools=("chmod", "cp", "xargs")), command)
 
     _assert_denied(result, leaked="ran")
     assert "Library" not in result.stdout
@@ -711,11 +715,20 @@ async def test_script_tools_run_their_interpreter_only_for_themselves(workspace:
     if not shasum.is_file() or not shasum.read_bytes().startswith(b"#!/usr/bin/perl"):
         pytest.skip("/usr/bin/shasum is not a perl script")
 
-    result = await _run(workspace.profile(tools=("shasum",)), "printf x | shasum && perl -e 'print qq(ran)'")
-
-    assert result.exit_code == 126, result
+    sandbox = MacOSSandbox(workspace.profile(tools=("shasum", "xargs")))
+    result = await sandbox.run("printf x | shasum")
+    assert result.exit_code == 0, result
     assert result.stdout == "11f6ad8ec52a2984abaafd7c3b516503785c2072  -\n"
-    assert "/usr/bin/perl: Operation not permitted" in result.stderr
+
+    rejected = await sandbox.run("perl -e 'print qq(ran)'")
+    assert rejected.exit_code == 126, rejected
+    assert rejected.stdout == ""
+    assert rejected.stderr.startswith("localmcp: ")
+
+    # Passing through an allowed launcher reaches Seatbelt's exec restriction.
+    denied = await sandbox.run("printf x | xargs /usr/bin/perl -e 'print qq(ran)'")
+    _assert_denied(denied, leaked="ran")
+    assert "Operation not permitted" in denied.stderr
 
 
 # Developer tools
@@ -926,7 +939,9 @@ async def test_developer_tools_cannot_run_each_others_helpers(workspace: Workspa
         pytest.skip("selected developer directory has no clang or git-daemon")
 
     result = await _run(
-        workspace.profile(tools=("clang",)), f"{daemon} --version", timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS
+        workspace.profile(tools=("clang", "xargs")),
+        f"printf x | xargs {daemon} --version",
+        timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
     _assert_denied(result)
@@ -953,8 +968,9 @@ async def test_tools_run_toolchain_python_through_the_shim(workspace: Workspace,
         pytest.skip("an Xcode.app shim cannot run in the sandbox")
 
     result = await _run(
-        workspace.profile(tools=("python3",)),
-        "/usr/bin/python3 -c 'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'",
+        workspace.profile(tools=("python3", "xargs")),
+        "printf x | xargs /usr/bin/python3 -c "
+        "'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
@@ -971,9 +987,9 @@ async def test_xcode_tools_run_by_name_but_not_through_the_shim(workspace: Works
         pytest.skip("selected developer directory is not inside an Xcode.app")
 
     result = await _run(
-        workspace.profile(tools=("python3",)),
+        workspace.profile(tools=("python3", "xargs")),
         "python3 -c 'import json, sqlite3; print(json.dumps(sqlite3.sqlite_version_info[0]))'"
-        " && /usr/bin/python3 -c 'print(4)'",
+        " && printf x | xargs /usr/bin/python3 -c 'print(4)'",
         timeout_seconds=_TOOLCHAIN_TIMEOUT_SECONDS,
     )
 
@@ -1027,6 +1043,18 @@ async def test_toolchains_are_unreadable_without_tools(workspace: Workspace) -> 
 # Resource limits
 
 
+@pytest.mark.parametrize(("command", "expected"), [("kill -TERM $$", 143), ("exit 143", 143), ("exit 7", 7)])
+async def test_signal_statuses_use_shell_convention_and_explicit_statuses_are_preserved(
+    workspace: Workspace, command: str, expected: int
+) -> None:
+    result = await _run(workspace.profile(tools=()), command)
+
+    assert result.exit_code == expected, result
+    assert result.stdout == ""
+    assert not result.timed_out
+    assert not result.truncated
+
+
 async def test_long_running_command_times_out_promptly(workspace: Workspace) -> None:
     started = time.monotonic()
 
@@ -1058,7 +1086,7 @@ async def test_excess_output_is_truncated_to_limit(workspace: Workspace) -> None
 # Leaves a grandchild in its own session with its output streams closed, so neither the process group nor the
 # pipes tie it to the command. It records that it started, then acts after the command has returned.
 _DETACHED = (
-    f"{_PERL} -e 'use POSIX; exit if fork; POSIX::setsid(); exit if fork; close STDIN; close STDOUT; close STDERR;"
+    "perl -e 'use POSIX; exit if fork; POSIX::setsid(); exit if fork; close STDIN; close STDOUT; close STDERR;"
     ' open my $f, ">", "started"; close $f; sleep 1; open $f, ">", "late"; close $f\';'
     " while [ ! -e started ]; do sleep 0.05; done"
 )
@@ -1100,7 +1128,7 @@ async def test_supervision_spares_concurrent_commands_with_the_same_profile(work
 async def test_detached_fork_storm_is_stopped_at_the_timeout(workspace: Workspace) -> None:
     storm = (
         "for i in $(seq 1 40); do"
-        f' ( {_PERL} -e \'use POSIX; POSIX::setsid(); fork; fork; sleep 2; open my $f, ">", "late"\' & );'
+        ' ( perl -e \'use POSIX; POSIX::setsid(); fork; fork; sleep 2; open my $f, ">", "late"\' & );'
         " done; sleep 30"
     )
     started = time.monotonic()

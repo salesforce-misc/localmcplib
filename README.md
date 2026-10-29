@@ -218,9 +218,11 @@ or times out, every process it started is killed, including background and
 detached ones. `create_sandbox(profile)` selects macOS Seatbelt or the Linux
 bubblewrap backend. The package-level `sandbox_tools` uses the same platform
 selection; the existing `seatbelt.sandbox_tools` remains macOS-specific.
-Linux requires bubblewrap, system Python 3, libseccomp, a merged `/usr`, and
-enabled user namespaces and Landlock. See [Linux sandbox support](docs/linux-sandbox.md)
+Linux requires bubblewrap 0.6.3 or newer, Bash, libseccomp, and permission to
+create user and cgroup namespaces. System and Nix-profile installations are
+supported; no in-sandbox Python launcher is needed. See [Linux sandbox support](docs/linux-sandbox.md)
 for installation, usage, and the remaining semantic differences.
+See the [0.7.0 release notes](CHANGELOG.md) for compatibility changes from 0.6.1.
 
 Nothing limits how much a command writes. Its temporary directory is writable
 only when the profile has a read-write root, so a read-only profile gets no
@@ -229,8 +231,9 @@ which must be outside every root, so what a command writes there counts against
 that volume rather than against any quota on a root's.
 
 `denied_paths` hide files and directories inside the roots. A denied path need
-not exist: one the host creates later is hidden too. Seatbelt denies the
-real path a file is opened by, so a denied path must not go through a symlink,
+not exist: on Linux, one created during a command is covered from the next
+command onward. Seatbelt denies the real path a file is opened by, so a
+denied path must not go through a symlink,
 and a denied file must have no other hard link, whose name would stay readable.
 The sandbox refuses to be created, or to run a command, while a denied path
 breaks either rule or cannot be checked, such as when it holds a directory the
@@ -245,11 +248,33 @@ root. A protected file must have no other hard link, whose name would stay
 writable, and no read-write root may lie inside a protected one; the sandbox
 refuses to be created or to run a command otherwise.
 
-A profile's `tools` are the complete list of commands its commands may run
-besides shell builtins; anything else fails with "Operation not permitted",
-including when a listed tool such as `awk`, `find` or `xargs` tries to run it,
-and so do programs copied or written into a root. The default,
-`INSPECTION_TOOLS`, covers reading, searching and comparing files. Extend it
+A shared Bash check requires each command name to be a bare literal name from
+the profile's `tools` or a short builtin allowlist. It also checks nested
+`$(...)` substitutions. An unlisted or dynamic command name, an executable
+path such as `/bin/cat` or `./script`, or unsupported syntax rejects the whole
+command before launch, with exit code 126 and a `localmcp:` diagnostic.
+Pipelines, ordinary quoting, redirections, substitutions, assignments, and
+common loops and conditionals are supported. Shell evaluation and dispatch
+builtins, functions, arithmetic, here-documents, backticks, `[[ ... ]]`, and
+process substitutions are excluded. Assignments cannot change shell settings,
+loader variables (`LD_*`/`DYLD_*`), or the sandbox's fixed environment such as
+`HOME`, `TMPDIR`, and Git configuration. `command` supports only literal
+`-v`/`-V` lookups.
+
+This check does not inspect programs interpreted or launched by a granted
+tool. On Linux, tools such as `awk`, `find`, `xargs`, and `git` can launch
+other programs, including repository code, within the sandbox's filesystem,
+network, and resource restrictions. Linux also exposes `/usr`, a curated
+set of `/etc` files, and `/nix/store` when present, read-only. It does not
+mount `/proc`, so tools depending on it, such as `ps`, cannot work normally.
+macOS retains additional OS enforcement of executable access: a granted tool
+cannot launch an unrelated executable or a program copied into a root.
+
+Both platforms report signal termination as `128 + signal` (for example,
+143 for SIGTERM), preserving explicit exit statuses in the same range.
+Timeouts and output-limit aborts return `-1` with the corresponding result flag.
+
+The default `INSPECTION_TOOLS` covers reading, searching and comparing files. Extend it
 with what an agent needs, such as
 `SandboxProfile(..., tools=(*INSPECTION_TOOLS, *WRITE_TOOLS, "git"))`, or pass
 `tools=()` to allow builtins only. `WRITE_TOOLS` adds `cp`, `mv`, `rm` and other
@@ -280,8 +305,8 @@ listed.
 Commands the sandbox can do without belong in `optional_tools`, such as
 `SandboxProfile(..., tools=(*INSPECTION_TOOLS, "git"), optional_tools=("rg",))`.
 Each one that is installed is granted in the same way. One that is missing or
-broken grants nothing and does not fail the sandbox, so a command that runs it
-fails with "command not found". The default description of the Bash tool from
+broken grants nothing and does not fail the sandbox. Naming an omitted tool
+fails the shared check with exit code 126. The default description of the Bash tool from
 `sandbox_tools` lists only the tools that can run.
 
 Homebrew is found only at its default prefixes, and the developer install only
