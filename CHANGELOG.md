@@ -22,7 +22,7 @@
   enforces an OS executable allowlist. macOS retains its Seatbelt restrictions.
 - Linux exposes read-only `/usr`, curated `/etc` entries, and `/nix/store`
   when present. It does not mount `/proc`. Missing denied paths created during
-  a command are covered from the next command onward. Scratch uses tmpfs.
+  a command are covered from the next command onward.
 
 ### Requirements and implementation
 

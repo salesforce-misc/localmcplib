@@ -272,10 +272,9 @@ class LinuxSandbox(CommandRuntime):
                 mounts.setdefault(path, not self._writable(path))
         for path in sorted(mounts, key=lambda item: (len(item.parts), str(item))):
             bind(path, path, read_only=mounts[path])
-        # Scratch is an isolated tmpfs; its host directory is only a unique name.
-        argv.extend(["--tmpfs", str(scratch), "--dev", "/dev", "--dir", "/var/empty"])
-        if not any(root.access == RootAccess.READ_WRITE for root in self.roots):
-            argv.extend(["--remount-ro", str(scratch)])
+        # Scratch stays on the host's temporary volume rather than consuming memory as a tmpfs.
+        bind(scratch, scratch, read_only=not any(root.access == RootAccess.READ_WRITE for root in self.roots))
+        argv.extend(["--dev", "/dev", "--dir", "/var/empty"])
         if self.profile.ipc:
             argv.extend(["--tmpfs", "/dev/shm"])
         argv.extend(["--remount-ro", "/dev"])

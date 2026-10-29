@@ -10,6 +10,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -201,18 +202,21 @@ async def test_missing_read_only_denials_stay_hidden_as_they_come_and_go(workspa
     assert result.stdout == "data\nvisible"
 
 
-def _create_when_read(ready: Path, secret: Path) -> None:
-    """Create ``secret`` once a command is blocked reading ``ready``, then let it continue."""
+def _open_when_read(ready: Path) -> int:
+    """Open ``ready`` for writing once a command is blocked reading it."""
     deadline = time.monotonic() + 5
     while True:
         try:
-            descriptor = os.open(ready, os.O_WRONLY | os.O_NONBLOCK)
+            return os.open(ready, os.O_WRONLY | os.O_NONBLOCK)
         except OSError as exc:
             if exc.errno != errno.ENXIO or time.monotonic() > deadline:
                 raise
             time.sleep(0.01)
-        else:
-            break
+
+
+def _create_when_read(ready: Path, secret: Path) -> None:
+    """Create ``secret`` once a command is blocked reading ``ready``, then let it continue."""
+    descriptor = _open_when_read(ready)
     try:
         secret.write_text("secret-sentinel")
         os.write(descriptor, b"go\n")
@@ -343,6 +347,27 @@ async def test_scratch_is_private_per_invocation_and_removed(workspace: Workspac
     assert first.stdout != second.stdout
     assert not Path(first.stdout).exists()
     assert not Path(second.stdout).exists()
+
+
+async def test_scratch_writes_reach_the_host_temporary_directory(workspace: Workspace) -> None:
+    # Scratch is the host directory rather than a tmpfs, so its writes consume disk rather than memory.
+    ready, location = workspace.writable / "ready", workspace.writable / "scratch"
+    os.mkfifo(ready)
+    sandbox = LinuxSandbox(workspace.profile(tools=()))
+    running = asyncio.create_task(
+        sandbox.run('printf x > "$TMPDIR/item" && printf %s "$TMPDIR" > scratch && read line < ready')
+    )
+    descriptor = await asyncio.to_thread(_open_when_read, ready)
+    try:
+        scratch = Path(location.read_text())
+        assert scratch.parent == Path(tempfile.gettempdir()).resolve()
+        assert (scratch / "item").read_text() == "x"
+        os.write(descriptor, b"go\n")
+    finally:
+        os.close(descriptor)
+    result = await running
+    assert result.exit_code == 0, result
+    assert not scratch.exists()
 
 
 @pytest.mark.parametrize("target", ['"$TMPDIR/file"', "/tmp/file", "/dev/shm/file", "/new-file"])

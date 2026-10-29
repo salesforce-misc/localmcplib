@@ -226,9 +226,9 @@ See the [0.7.0 release notes](CHANGELOG.md) for compatibility changes from 0.6.1
 
 Nothing limits how much a command writes. Its temporary directory is writable
 only when the profile has a read-write root, so a read-only profile gets no
-space to fill. The temporary path must be outside every root. On macOS it uses
-the caller's temporary volume; on Linux it is a private tmpfs. Neither has a
-write quota.
+space to fill. The directory is created in the caller's temporary directory,
+which must be outside every root, so what a command writes there counts against
+that volume rather than against any quota on a root's.
 
 `denied_paths` hide files and directories inside the roots. A denied path need
 not exist: on Linux, one created during a command is covered from the next

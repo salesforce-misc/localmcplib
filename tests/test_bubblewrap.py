@@ -198,9 +198,10 @@ def test_scratch_and_device_writes_are_explicit(host: Host, tmp_path: Path, writ
     sandbox = LinuxSandbox(SandboxProfile((SandboxRoot(host.root, access),), tools=(), ipc=ipc))
     scratch = tmp_path / "scratch"
     argv = sandbox._invocation("true", scratch, tmp_path / "control")
-    assert (str(scratch),) in _operations(argv, "--tmpfs", 1)
+    # Scratch is the host directory itself, so its writes use disk rather than memory.
+    assert (str(scratch), str(scratch)) in _operations(argv, "--bind" if writable else "--ro-bind")
+    assert (str(scratch),) not in _operations(argv, "--tmpfs", 1)
     readonly = _operations(argv, "--remount-ro", 1)
-    assert ((str(scratch),) in readonly) is not writable
     assert ("/",) in readonly and ("/dev",) in readonly
     assert (("/dev/shm",) in _operations(argv, "--tmpfs", 1)) is ipc
 

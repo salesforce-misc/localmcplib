@@ -129,13 +129,16 @@ and protected paths are rechecked for symlinks and hard links before launch.
 Concurrent changes by another host process are outside this path-based
 policy's guarantees; callers must keep policy paths stable during setup.
 
-Every command receives a private tmpfs at its unique scratch path, writable
-only if a root is writable. `/dev` provides standard devices, with directory
+Every command receives a fresh directory in the caller's temporary directory
+as its scratch path, bound at the same path and writable only if a root is
+writable. Its writes use that volume's space, not memory, and it is removed
+after the command. `/dev` provides standard devices, with directory
 writes disabled. Synthetic ancestors and the sandbox root filesystem are
 read-only. `/proc` is not mounted, so `ps`, `/proc/self`, `/dev/fd`-dependent
 operations, and similar facilities are unavailable. With `ipc=True`, a
 separate writable tmpfs at `/dev/shm` enables POSIX shared memory even for
-otherwise read-only profiles.
+otherwise read-only profiles. That tmpfs is memory-backed and unsized, since
+bubblewrap 0.6.3 cannot set a tmpfs size.
 
 Managed Git worktrees need both the worktree root and a root granting their
 common Git metadata directory. The backend does not discover or grant Git
