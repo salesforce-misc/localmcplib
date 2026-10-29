@@ -21,7 +21,7 @@ from localmcp.sandbox.base import (
     SandboxError,
     SandboxProfile,
 )
-from localmcp.sandbox.command_policy import check_command
+from localmcp.sandbox.command_policy import rejected_command
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
@@ -287,8 +287,8 @@ class LinuxSandbox(CommandRuntime):
 
     async def run(self, command: str) -> CommandResult:
         validate_command(command)
-        if reason := check_command(command, self.tools):
-            return CommandResult(exit_code=126, stdout="", stderr=f"localmcp: {reason}")
+        if (rejected := rejected_command(command, self.tools)) is not None:
+            return rejected
         await asyncio.to_thread(self._validate_paths)
         with (
             tempfile.TemporaryDirectory(prefix="localmcp-", dir=self._scratch_parent) as scratch_name,

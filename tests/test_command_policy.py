@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from localmcp.sandbox.command_policy import check_command
+from localmcp.sandbox import CommandResult
+from localmcp.sandbox.command_policy import check_command, rejected_command
 from localmcp.sandbox.runtime import command_environment
 
 TOOLS = ("cat", "head", "grep", "find", "git", "awk", "xargs", "sed", "sort", "wc", "sleep", "touch")
@@ -205,3 +206,10 @@ def test_every_fixed_environment_variable_is_protected(developer_directory: Path
 def test_numeric_shell_variables_cannot_evaluate_unchecked_commands() -> None:
     command = "value='array[$(unlisted)]'; RANDOM=$value"
     assert check_command(command, TOOLS)
+
+
+def test_rejection_result_is_shared_by_both_backends() -> None:
+    assert rejected_command("cat file", TOOLS) is None
+    assert rejected_command("ls", TOOLS) == CommandResult(
+        exit_code=126, stdout="", stderr="localmcp: command is not allowed: ls"
+    )

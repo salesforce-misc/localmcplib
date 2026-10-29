@@ -12,6 +12,7 @@ from pathlib import Path
 import tree_sitter_bash
 from tree_sitter import Language, Node, Parser
 
+from localmcp.sandbox.base import CommandResult
 from localmcp.sandbox.runtime import command_environment
 
 _LANGUAGE = Language(tree_sitter_bash.language())
@@ -301,4 +302,11 @@ def check_command(command: str, tools: tuple[str, ...]) -> str | None:
             if (node.text or b"").startswith(b"[[") or not _test_arguments(_test_tokens(node)):
                 return "unsupported test expression"
         pending.extend(reversed(node.children))
+    return None
+
+
+def rejected_command(command: str, tools: tuple[str, ...]) -> CommandResult | None:
+    """Return the result both backends report for a rejected command, or ``None`` to run it."""
+    if reason := check_command(command, tools):
+        return CommandResult(exit_code=126, stdout="", stderr=f"localmcp: {reason}")
     return None

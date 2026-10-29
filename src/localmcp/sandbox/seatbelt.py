@@ -33,7 +33,7 @@ from localmcp.sandbox.base import (
 from localmcp.sandbox.base import (
     SandboxRoot as SandboxRoot,
 )
-from localmcp.sandbox.command_policy import check_command
+from localmcp.sandbox.command_policy import rejected_command
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
@@ -581,8 +581,8 @@ class MacOSSandbox(CommandRuntime):
 
     async def run(self, command: str) -> CommandResult:
         validate_command(command)
-        if reason := check_command(command, self.tools):
-            return CommandResult(exit_code=126, stdout="", stderr=f"localmcp: {reason}")
+        if (rejected := rejected_command(command, self.tools)) is not None:
+            return rejected
         limits = [
             f"ulimit -t {max(1, int(self.timeout_seconds))}",
             f"ulimit -n {MAX_OPEN_FILES}",
