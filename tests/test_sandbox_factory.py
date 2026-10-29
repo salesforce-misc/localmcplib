@@ -147,20 +147,14 @@ async def test_legacy_seatbelt_wrapper_keeps_explicit_mac_binding(
     assert seatbelt.BashInput is sandbox_api.BashInput
 
 
-def test_shared_environment_does_not_inherit_or_override_authority(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_shared_environment_does_not_inherit_authority(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("SSH_AUTH_SOCK", "/caller/agent")
+    monkeypatch.setenv("HOME", "/caller/home")
     monkeypatch.setenv("PATH", "/caller/bin")
 
-    environment = command_environment(
-        tmp_path,
-        bin_directories=(Path("/trusted/bin"),),
-        extra={"HOME": "/caller/home", "PATH": "/caller/bin", "DEVELOPER_DIR": "/trusted/developer"},
-    )
+    environment = command_environment(tmp_path, bin_directories=(Path("/trusted/bin"),))
 
     assert "SSH_AUTH_SOCK" not in environment
     assert environment["HOME"] == "/var/empty"
     assert environment["PATH"] == "/trusted/bin:/usr/bin:/bin:/usr/sbin:/sbin"
     assert environment["TMPDIR"] == str(tmp_path)
-    assert environment["DEVELOPER_DIR"] == "/trusted/developer"

@@ -149,17 +149,18 @@ def test_command_exit_code_uses_shell_signal_convention(returncode: int, expecte
     assert runtime.command_exit_code(returncode) == expected
 
 
-def test_developer_environment_pins_the_toolchain_and_scratch_cache_over_extra_values(tmp_path: Path) -> None:
+def test_developer_environment_pins_the_toolchain_and_scratch_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("DEVELOPER_DIR", "/unselected")
+    monkeypatch.setenv("xcrun_db", "/outside/cache")
     scratch = tmp_path / "scratch"
     developer = tmp_path / "selected-developer"
-    extra = {"DEVELOPER_DIR": "/unselected", "xcrun_db": "/outside/cache", "CUSTOM": "retained"}
 
-    environment = runtime.command_environment(scratch, developer_directory=developer, extra=extra)
+    environment = runtime.command_environment(scratch, developer_directory=developer)
 
     assert environment["DEVELOPER_DIR"] == str(developer)
     assert environment["xcrun_db"] == str(scratch / "xcrun_db")
-    assert environment["CUSTOM"] == "retained"
-    assert extra == {"DEVELOPER_DIR": "/unselected", "xcrun_db": "/outside/cache", "CUSTOM": "retained"}
 
 
 def test_developer_environment_is_absent_without_a_selected_toolchain(

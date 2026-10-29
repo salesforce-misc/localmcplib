@@ -129,12 +129,11 @@ def command_environment(
     scratch: Path,
     *,
     bin_directories: tuple[Path, ...] = (),
-    extra: dict[str, str] | None = None,
     developer_directory: Path | None = None,
 ) -> dict[str, str]:
     """Build a fresh environment without consulting the caller's environment."""
     paths = [*map(os.fspath, bin_directories), "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-    environment = (extra or {}) | {
+    environment = {
         "HOME": "/var/empty",
         "PATH": os.pathsep.join(paths),
         "LC_ALL": "C",
