@@ -222,6 +222,7 @@ Linux requires bubblewrap 0.6.3 or newer, Bash, libseccomp, and permission to
 create user and cgroup namespaces. System and Nix-profile installations are
 supported; no in-sandbox Python launcher is needed. See [Linux sandbox support](docs/linux-sandbox.md)
 for installation, usage, and the remaining semantic differences.
+See the [0.7.0 release notes](CHANGELOG.md) for compatibility changes from 0.6.1.
 
 Nothing limits how much a command writes. Its temporary directory is writable
 only when the profile has a read-write root, so a read-only profile gets no
