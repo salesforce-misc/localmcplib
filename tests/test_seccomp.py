@@ -75,6 +75,18 @@ def test_library_discovery_prefers_system_and_resolves_nix_links(
         seccomp.find_library((profile,))
 
 
+@pytest.mark.parametrize(
+    ("machine", "native", "foreign"),
+    [("x86_64", "x86_64-linux-gnu", "aarch64-linux-gnu"), ("aarch64", "aarch64-linux-gnu", "x86_64-linux-gnu")],
+)
+def test_library_discovery_skips_other_architectures(machine: str, native: str, foreign: str) -> None:
+    # A multiarch host can carry another architecture's libseccomp, which cannot be loaded.
+    directories = seccomp._library_directories(machine)
+    assert directories[:2] == (Path("/lib") / native, Path("/usr/lib") / native)
+    assert not any(foreign in str(directory) for directory in directories)
+    assert seccomp._library_directories("riscv64") == tuple(map(Path, ("/lib64", "/usr/lib64", "/lib", "/usr/lib")))
+
+
 def test_library_loading_requires_an_absolute_path(library: SimpleNamespace) -> None:
     with pytest.raises(SandboxError, match="must be absolute"):
         seccomp.build_filter(Path("libseccomp.so.2"), network=False, ipc=False)

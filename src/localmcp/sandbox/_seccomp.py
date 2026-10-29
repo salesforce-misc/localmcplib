@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import platform
 import tempfile
 from pathlib import Path
 
@@ -16,21 +17,17 @@ _SCMP_CMP_EQ = 4
 _SCMP_CMP_GE = 5
 _SCMP_CMP_MASKED_EQ = 7
 _CLONE_NAMESPACE_FLAGS = (0x80, 0x20000, 0x2000000, 0x4000000, 0x8000000, 0x10000000, 0x20000000, 0x40000000)
-_LIBRARY_DIRECTORIES = tuple(
-    map(
-        Path,
-        (
-            "/lib/x86_64-linux-gnu",
-            "/usr/lib/x86_64-linux-gnu",
-            "/lib/aarch64-linux-gnu",
-            "/usr/lib/aarch64-linux-gnu",
-            "/lib64",
-            "/usr/lib64",
-            "/lib",
-            "/usr/lib",
-        ),
-    )
-)
+_MULTIARCH_TRIPLETS = {"x86_64": "x86_64-linux-gnu", "aarch64": "aarch64-linux-gnu"}
+
+
+def _library_directories(machine: str) -> tuple[Path, ...]:
+    """List system library directories, skipping other architectures' multiarch directories."""
+    triplet = _MULTIARCH_TRIPLETS.get(machine)
+    multiarch = (f"/lib/{triplet}", f"/usr/lib/{triplet}") if triplet else ()
+    return tuple(map(Path, (*multiarch, "/lib64", "/usr/lib64", "/lib", "/usr/lib")))
+
+
+_LIBRARY_DIRECTORIES = _library_directories(platform.machine())
 
 
 def find_library(nix_profiles: tuple[Path, ...] = ()) -> Path:

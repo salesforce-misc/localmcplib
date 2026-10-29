@@ -36,12 +36,14 @@ Bubblewrap itself runs on the host, so its resolved executable need not be
 inside a workload mount. Writable roots cannot include that host launcher.
 
 Libseccomp is loaded by absolute path, preferring standard system library
-directories and then the resolved profiles' `lib` directories. It must know
+directories and then the resolved profiles' `lib` directories. Multiarch
+directories for other architectures are skipped. It must know
 every syscall in the policy; an unknown name rejects construction. Known
 architecture-specific pseudo syscall numbers are handled by libseccomp.
 The native BPF filter is compiled once per sandbox and supplied to bubblewrap
 through a separate descriptor per invocation. The library is never loaded
-inside the sandbox. Both x86-64 and AArch64 are supported.
+inside the sandbox. The backend targets x86-64 and AArch64, but enforcement
+has so far been validated only on x86-64.
 
 ## Usage
 
