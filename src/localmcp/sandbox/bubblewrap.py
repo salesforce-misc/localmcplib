@@ -1,33 +1,27 @@
-"""Linux command execution using bubblewrap, Landlock, and seccomp.
-
-The backend deliberately fails closed when the host cannot enforce its policy.
-See the sandbox documentation for the Linux filesystem and script-tool limitations.
-"""
+"""Linux command execution using bubblewrap and a host-built seccomp filter."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import re
+import pwd
 import signal
-import stat
-import struct
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
+from localmcp.sandbox._seccomp import build_filter, find_library
 from localmcp.sandbox.base import (
     DEFAULT_COMMAND_TIMEOUT_SECONDS,
     DEFAULT_MAX_OUTPUT_BYTES,
-    MAX_OPEN_FILES,
     CommandResult,
     RootAccess,
     SandboxError,
     SandboxProfile,
 )
+from localmcp.sandbox.command_policy import check_command
 from localmcp.sandbox.policy import (
     _check_denied_paths,
     _check_scratch,
@@ -39,16 +33,23 @@ from localmcp.sandbox.policy import (
 from localmcp.sandbox.runtime import (
     CommandRuntime,
     _OutputLimitExceeded,
+    check_host_runtime,
     command_environment,
-    process_limit,
+    limited_command,
+    owned_process_limit,
     validate_command,
     validate_limits,
 )
 
 _BIN_DIRECTORIES = tuple(map(Path, ("/usr/bin", "/bin", "/usr/sbin", "/sbin")))
-# Tool code is trusted only beneath /usr, so these must be merged-/usr links into it.
-_MERGED_USR_LINKS = tuple(map(Path, ("/bin", "/sbin", "/lib", "/lib64")))
-_RUNTIME_TREES = tuple(map(Path, ("/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/libexec")))
+_RUNTIME_TREES = tuple(map(Path, ("/usr", "/nix/store")))
+_RUNTIME_ALIASES = tuple(map(Path, ("/bin", "/lib", "/lib64", "/sbin")))
+_ETC_PATHS = tuple(
+    map(
+        Path,
+        ("/etc/ld.so.cache", "/etc/alternatives", "/etc/passwd", "/etc/group", "/etc/localtime", "/etc/os-release"),
+    )
+)
 _NETWORK_PATHS = tuple(
     map(
         Path,
@@ -59,224 +60,94 @@ _NETWORK_PATHS = tuple(
             "/etc/gai.conf",
             "/etc/ssl/certs",
             "/etc/ssl/openssl.cnf",
-            "/usr/share/ca-certificates",
+            "/etc/pki/tls/certs",
+            "/etc/pki/ca-trust",
         ),
     )
 )
-_CONTROL = Path("/localmcp")
-# Hiding a missing denied path mounts each entry of its directory back individually,
-# so bound the mounts and arguments that one rebuilt directory can add.
-_MAX_REBUILT_ENTRIES = 1024
-# Snapshot trusted launcher code before a workload can modify an editable install.
-# Reading this file again per invocation would make a writable source checkout
-# capable of replacing the next command's privileged setup code.
-_RUNNER_SOURCE = Path(__file__).with_name("_linux_runner.py").read_bytes()
+_NIX_STORE = Path("/nix/store")
 
 
 def _require_linux() -> None:
     if sys.platform != "linux":
         raise SandboxError("Linux bubblewrap sandbox is unavailable on this platform")
-    for path in _MERGED_USR_LINKS:
-        if path.is_dir() and not path.is_symlink():
-            raise SandboxError(f"Linux sandbox requires a merged /usr, but {path} is a separate directory")
 
 
-def _trusted_program(path: Path) -> Path:
-    resolved = path.resolve(strict=True)
-    if not any(resolved.is_relative_to(tree.resolve()) for tree in _RUNTIME_TREES if tree.is_dir()):
-        raise SandboxError(f"Linux sandbox tool code is outside the system runtime: {resolved}")
-    return resolved
+def _nix_profile_links() -> tuple[Path, ...]:
+    """List supported profile links, skipping account profiles without a usable account entry."""
+    try:
+        account = pwd.getpwuid(os.getuid())
+    except KeyError:
+        account = None
+    per_user = (
+        (Path("/nix/var/nix/profiles/per-user") / account.pw_name / "profile",)
+        if account is not None and account.pw_name and "/" not in account.pw_name
+        else ()
+    )
+    home = Path(account.pw_dir) if account is not None else None
+    in_home = (
+        (home / ".nix-profile", home / ".local/state/nix/profiles/profile")
+        if home is not None and home.is_absolute()
+        else ()
+    )
+    return (Path("/nix/var/nix/profiles/default"), *per_user, Path("/run/current-system/sw"), *in_home)
 
 
-def _program(name: str) -> Path | None:
-    for directory in _BIN_DIRECTORIES:
+def _nix_profiles() -> tuple[tuple[Path, Path], ...]:
+    """Snapshot supported profile links into the store without using the caller's PATH."""
+    profiles: list[tuple[Path, Path]] = []
+    for profile in _nix_profile_links():
+        try:
+            resolved = profile.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.is_relative_to(_NIX_STORE) and (resolved / "bin").is_dir():
+            profiles.append((profile, resolved))
+    return tuple(profiles)
+
+
+def _program(name: str, directories: tuple[Path, ...]) -> Path | None:
+    for directory in directories:
         candidate = directory / name
         if candidate.is_file() and os.access(candidate, os.X_OK):
             return candidate
     return None
 
 
-def _multicall(program: Path) -> bool:
-    providers = ("busybox", "coreutils", "toybox")
-    if program.name in providers:
-        return True
-    return any(
-        candidate.is_file() and program.samefile(candidate)
-        for directory in _BIN_DIRECTORIES
-        for name in providers
-        for candidate in (directory / name,)
-    )
-
-
-def _helpers(tool: str) -> tuple[Path, ...]:
-    return tuple(
-        helper.resolve()
-        for parent in (Path("/usr/lib"), Path("/usr/libexec"))
-        for helper in (parent / tool, parent / f"{tool}-core")
-        if helper.is_dir()
-    )
-
-
-def _interpreter(path: Path) -> Path | None:
-    with path.open("rb") as stream:
-        line = stream.readline(512)
-    words = line[2:].split() if line.startswith(b"#!") else []
-    return Path(os.fsdecode(words[0])).resolve(strict=True) if words else None
-
-
-def _elf_interpreter(path: Path) -> Path | None:
-    """Read PT_INTERP without executing the program or consulting its environment."""
-    with path.open("rb") as stream:
-        header = stream.read(64)
-        if not header.startswith(b"\x7fELF"):
-            return None
-        if len(header) < 52 or header[4] not in (1, 2) or header[5] not in (1, 2):
-            raise SandboxError(f"unsupported ELF program: {path}")
-        endian = "<" if header[5] == 1 else ">"
-        wide = header[4] == 2
-        offset = struct.unpack_from(endian + ("Q" if wide else "I"), header, 32 if wide else 28)[0]
-        size, count = struct.unpack_from(endian + "HH", header, 54 if wide else 42)
-        for index in range(count):
-            stream.seek(offset + index * size)
-            entry = stream.read(size)
-            if len(entry) < (56 if wide else 32):
-                raise SandboxError(f"invalid ELF program headers: {path}")
-            if struct.unpack_from(endian + "I", entry)[0] == 3:
-                start = struct.unpack_from(endian + ("Q" if wide else "I"), entry, 8 if wide else 4)[0]
-                length = struct.unpack_from(endian + ("Q" if wide else "I"), entry, 32 if wide else 16)[0]
-                if length > 4096:
-                    raise SandboxError(f"invalid ELF interpreter: {path}")
-                stream.seek(start)
-                return Path(os.fsdecode(stream.read(length).rstrip(b"\0"))).resolve(strict=True)
-    return None
-
-
-def _libraries(program: Path) -> tuple[Path, ...]:
-    """Inspect trusted distro programs only; workload programs never reach ldd."""
-    _trusted_program(program)
-    if _elf_interpreter(program) is None:
-        return ()
+def _resolved_program(program: Path) -> Path:
+    """Pin an executable's real path or report a sandbox setup failure."""
     try:
-        result = subprocess.run(
-            ["/usr/bin/ldd", os.fspath(program)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise SandboxError("Linux sandbox requires the system ldd utility") from exc
-    if result.returncode or "not found" in result.stdout:
-        raise SandboxError(f"cannot resolve shared libraries for sandbox tool: {program}")
-    paths: list[Path] = []
-    for line in result.stdout.splitlines():
-        match = re.search(r"(?:^\s*|=>\s*)(/\S+)\s+\(", line)
-        if match:
-            paths.append(_trusted_program(Path(match[1])))
-    if not paths:
-        raise SandboxError(f"cannot resolve shared libraries for sandbox tool: {program}")
-    return tuple(dict.fromkeys(paths))
+        return program.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise SandboxError(f"cannot resolve sandbox executable: {program}") from exc
 
 
-@dataclass(frozen=True)
-class _Tools:
-    names: tuple[str, ...]
-    executables: tuple[Path, ...]
-    helpers: tuple[Path, ...]
-    maps: tuple[Path, ...]
-    data: tuple[Path, ...]
-    aliases: tuple[tuple[Path, str], ...]
+def _runtime_program(program: Path, runtime_trees: tuple[Path, ...]) -> Path:
+    """Require the resolved executable to be present in a mounted runtime tree."""
+    resolved = _resolved_program(program)
+    if not any(resolved.is_relative_to(tree) for tree in runtime_trees):
+        raise SandboxError(f"sandbox executable is outside the mounted runtime: {resolved}")
+    return resolved
 
 
-def _tool_grants(profile: SandboxProfile) -> _Tools:
-    shell = _trusted_program(Path("/bin/sh"))
-    required = set(profile.tools)
-    programs: dict[str, Path] = {}
-    for name in (*profile.tools, *profile.optional_tools):
-        program = _program(name)
-        if program is None:
-            if name in required:
-                raise SandboxError(f"sandbox tool is not installed: {name}")
-            continue
-        programs[name] = program
-    explicitly_allowed = {shell, *(program.resolve() for name, program in programs.items() if name in required)}
-    executables = [shell]
-    helpers: list[Path] = []
-    maps: list[Path] = []
-    data: list[Path] = []
-    aliases: dict[Path, str] = {}
+def _tools(profile: SandboxProfile, directories: tuple[Path, ...], runtime_trees: tuple[Path, ...]) -> tuple[str, ...]:
     granted: list[str] = []
-    for name, program in programs.items():
+    for name in (*profile.tools, *profile.optional_tools):
+        program = _program(name, directories)
         try:
-            resolved = _trusted_program(program)
-            interpreter = _interpreter(resolved)
-            if interpreter is not None and interpreter not in explicitly_allowed:
-                raise SandboxError(
-                    f"Linux sandbox script tool {name!r} requires its interpreter to be explicitly listed in tools"
-                )
-            if _multicall(resolved):
-                raise SandboxError(f"Linux sandbox cannot restrict individual commands of multicall tool: {name}")
-            tool_helpers = _helpers(name)
-            # Landlock grants execution by where a symlink's target lives, and a target
-            # inside a helper tree is scanned itself. Links out of the tree, such as
-            # package data under /usr/share, cannot execute and are skipped, not rejected.
-            native_helpers = {
-                _trusted_program(candidate)
-                for tree in tool_helpers
-                for candidate in tree.rglob("*")
-                if not candidate.is_symlink() and candidate.is_file() and os.access(candidate, os.X_OK)
-            }
-            code = (interpreter or resolved, *sorted(native_helpers, key=os.fspath))
-            libraries = tuple(library for program in code for library in _libraries(program))
-            loaders = tuple(loader for program in code if (loader := _elf_interpreter(program)) is not None)
-        except (OSError, SandboxError) as exc:
-            if name in required:
-                if isinstance(exc, SandboxError):
-                    raise
-                raise SandboxError(f"cannot inspect sandbox tool: {name}") from exc
-            continue
-        granted.append(name)
-        executables.extend((resolved, *loaders))
-        helpers.extend(tool_helpers)
-        maps.extend(libraries)
-        # Alternatives links are reproduced individually, without exposing all of /etc.
-        link = program
-        seen: set[Path] = set()
-        while link.is_symlink() and link not in seen:
-            seen.add(link)
-            target = os.readlink(link)
-            if link.is_relative_to("/etc"):
-                aliases[link] = target
-            link = Path(os.path.abspath(link.parent / target))
-        for candidate in (Path("/usr/share") / name, Path("/usr/share") / f"{name}-core"):
-            if candidate.exists():
-                data.append(candidate.resolve())
-        if name == "file":
-            for candidate in (
-                Path("/usr/share/misc/magic"),
-                Path("/usr/share/misc/magic.mgc"),
-                Path("/usr/share/file/magic.mgc"),
-            ):
-                if candidate.exists():
-                    data.append(candidate.resolve())
-                    if candidate.is_symlink():
-                        aliases[candidate] = os.readlink(candidate)
-    maps.extend(_libraries(shell))
-    if interpreter := _elf_interpreter(shell):
-        executables.append(interpreter)
-    return _Tools(
-        tuple(granted),
-        tuple(dict.fromkeys(executables)),
-        tuple(dict.fromkeys(helpers)),
-        tuple(dict.fromkeys(maps)),
-        tuple(dict.fromkeys(data)),
-        tuple(aliases.items()),
-    )
+            if program is None:
+                raise SandboxError(f"sandbox tool is not installed: {name}")
+            _runtime_program(program, runtime_trees)
+        except SandboxError:
+            if name in profile.tools:
+                raise
+        else:
+            granted.append(name)
+    return tuple(dict.fromkeys(granted))
 
 
 class LinuxSandbox(CommandRuntime):
-    """Run bounded commands under mandatory Linux namespace and syscall enforcement."""
+    """Run bounded Bash commands with filesystem, namespace, and syscall restrictions."""
 
     def __init__(
         self,
@@ -289,6 +160,7 @@ class LinuxSandbox(CommandRuntime):
         validate_limits(timeout_seconds, max_output_bytes, process_label)
         _require_linux()
         self.roots = _validated_roots(profile.roots)
+        check_host_runtime(self.roots)
         self.root = self.roots[0].path
         self.profile = SandboxProfile(
             self.roots,
@@ -300,17 +172,33 @@ class LinuxSandbox(CommandRuntime):
         )
         self._protected_paths = _protected_roots(self.roots)
         self._validate_paths()
-        self._grants = _tool_grants(self.profile)
-        self.tools = self._grants.names
-        self._runtime_trees = tuple(dict.fromkeys(path.resolve() for path in _RUNTIME_TREES if path.is_dir()))
+        self._profiles = _nix_profiles()
+        self._bin_directories = tuple(dict.fromkeys((store / "bin").resolve() for _, store in self._profiles))
+        self._runtime_trees = tuple(path for path in _RUNTIME_TREES if path.is_dir())
+        self._runtime_aliases = tuple(path for path in _RUNTIME_ALIASES if path.exists())
+        mounted_runtime = tuple(
+            path.resolve()
+            for path in (*self._runtime_trees, *(path for path in self._runtime_aliases if not path.is_symlink()))
+        )
+        directories = (*self._bin_directories, *_BIN_DIRECTORIES)
+        bwrap = _program("bwrap", (*_BIN_DIRECTORIES, *self._bin_directories))
+        shell = _program("bash", directories)
+        if bwrap is None or shell is None:
+            raise SandboxError("Linux sandbox requires bubblewrap and bash in system directories or a Nix profile")
+        # Bubblewrap runs on the host; only workload executables need runtime mounts.
+        self._bwrap = _resolved_program(bwrap)
+        if any(root.access == RootAccess.READ_WRITE and self._bwrap.is_relative_to(root.path) for root in self.roots):
+            raise SandboxError(f"writable sandbox root overlaps the host bubblewrap launcher: {self._bwrap}")
+        self._shell = _runtime_program(shell, mounted_runtime)
+        self.tools = _tools(self.profile, directories, mounted_runtime)
+        self._etc_paths = tuple(
+            path for path in (*_ETC_PATHS, *(_NETWORK_PATHS if profile.network else ())) if path.exists()
+        )
         grants = (
             *self._runtime_trees,
-            *self._grants.executables,
-            *self._grants.helpers,
-            *self._grants.maps,
-            *self._grants.data,
-            _CONTROL,
-            Path("/proc"),
+            *self._runtime_aliases,
+            *(link for link, _ in self._profiles),
+            Path("/etc"),
             Path("/dev"),
             Path("/var/empty"),
         )
@@ -322,231 +210,86 @@ class LinuxSandbox(CommandRuntime):
         self.timeout_seconds = timeout_seconds
         self.max_output_bytes = max_output_bytes
         self.process_label = process_label
-        self._bwrap = Path("/usr/bin/bwrap")
-        self._python = Path("/usr/bin/python3")
-        # Linux counts RLIMIT_NPROC per user namespace, so the caller's other processes
-        # do not count. Each command's namespace holds only its supervisor, PID 1, before
-        # the workload; the host's per-user limit still applies above the namespace.
-        self._process_limit = process_limit(1)
+        library = find_library(tuple(store for _, store in self._profiles))
+        self._seccomp_filter = build_filter(library, network=profile.network, ipc=profile.ipc)
 
     def _validate_paths(self) -> None:
         _check_denied_paths(self.profile.denied_paths)
         _check_denied_paths(self._protected_paths, "read-only root")
 
     def _writable(self, path: Path) -> bool:
-        """Whether a read-write root holds ``path`` outside every write-protected root."""
         return any(
             root.access == RootAccess.READ_WRITE and path.is_relative_to(root.path) for root in self.roots
         ) and not any(path.is_relative_to(protected) for protected in self._protected_paths)
 
-    def _denial_layout(self) -> tuple[dict[Path, bool], dict[Path, set[str]], tuple[Path, ...]]:
-        """Plan this command's denials from the host as it is now.
-
-        Returns the ancestors to pin, the read-only directories to rebuild without
-        their missing denied entries, and the denied paths that exist to cover.
-        """
-        denied = tuple(
-            path
-            for path in self.profile.denied_paths
-            if not any(path != other and path.is_relative_to(other) for other in self.profile.denied_paths)
-        )
-        pinned: dict[Path, bool] = {}
-        rebuilt: dict[Path, set[str]] = {}
-        present: list[Path] = []
-        for path in denied:
-            try:
-                path.lstat()
-            except (FileNotFoundError, NotADirectoryError):
-                pass
-            else:
-                present.append(path)
-                continue
-            # A missing path cannot be covered by a mount, so hide it in its nearest
-            # existing ancestor instead. A writable ancestor is left alone: rebuilding it
-            # would stop commands from changing it, so the path is covered by the first
-            # command after it appears.
-            child, parent = path, path.parent
-            while True:
-                if not any(parent.is_relative_to(root.path) for root in self.roots):
-                    raise SandboxError(f"sandbox root no longer exists for denied path: {path}")
-                try:
-                    mode = parent.lstat().st_mode
-                except (FileNotFoundError, NotADirectoryError):
-                    child, parent = parent, parent.parent
-                    continue
-                break
-            if self._writable(parent):
-                continue
-            if stat.S_ISLNK(mode):
-                raise SandboxError(f"sandbox denied path goes through a symlink and cannot be enforced: {path}")
-            if stat.S_ISDIR(mode):
-                rebuilt.setdefault(parent, set()).add(child.name)
-            else:
-                # Nothing can exist beneath a non-directory; pinning it keeps one from replacing it.
-                pinned[parent] = True
-        # Pin ancestors as mount points so a rename cannot relocate a protected path.
-        for path in _path_ancestors((*present, *self._protected_paths)):
-            if any(path.is_relative_to(root.path) for root in self.roots):
-                pinned.setdefault(path, not self._writable(path))
-        return pinned, rebuilt, tuple(present)
-
-    def _invocation(self, command: str, scratch: Path, control: Path) -> tuple[list[str], dict[str, object]]:
-        writable = any(root.access == RootAccess.READ_WRITE for root in self.roots)
+    def _invocation(self, command: str, scratch: Path, control: Path) -> list[str]:
         argv = [
             str(self._bwrap),
             "--unshare-user",
             "--uid",
-            "0",
+            str(os.getuid()),
             "--gid",
-            "0",
+            str(os.getgid()),
             "--unshare-pid",
             "--unshare-ipc",
             "--unshare-uts",
-            "--as-pid-1",
+            "--unshare-cgroup",
             "--die-with-parent",
             "--new-session",
             "--cap-drop",
             "ALL",
-            "--cap-add",
-            "CAP_SYS_ADMIN",
-            "--cap-add",
-            "CAP_SETPCAP",
+            "--clearenv",
         ]
         if not self.profile.network:
             argv.append("--unshare-net")
-        readonly: list[str] = []
+        for name, value in command_environment(scratch, bin_directories=self._bin_directories).items():
+            argv.extend(["--setenv", name, value])
 
         def bind(source: Path, target: Path, *, read_only: bool = True) -> None:
             argv.extend(["--ro-bind" if read_only else "--bind", str(source), str(target)])
-            if read_only:
-                readonly.append(str(target))
 
         for tree in self._runtime_trees:
             bind(tree, tree)
-        for path in _MERGED_USR_LINKS:
+        for path in self._runtime_aliases:
             if path.is_symlink():
                 argv.extend(["--symlink", os.readlink(path), str(path)])
-        cache = Path("/etc/ld.so.cache")
-        if cache.is_file():
-            bind(cache, cache)
-        for path, target in self._grants.aliases:
-            argv.extend(["--symlink", target, str(path)])
-        for path in self._grants.data:
-            if not any(path.is_relative_to(tree) for tree in self._runtime_trees):
-                bind(path, path)
-        if self.profile.network:
-            for path in _NETWORK_PATHS:
-                if path.exists():
-                    bind(path.resolve(), path)
-        pinned, rebuilt, present = self._denial_layout()
-        mounts = {root.path: root.access == RootAccess.READ_ONLY for root in self.roots}
-        for path, read_only in pinned.items():
-            mounts.setdefault(path, read_only)
-        # A rebuilt directory is an empty tmpfs holding a mount for each of its entries
-        # except the missing denied ones, so one the host creates while the command runs
-        # stays hidden; the next command covers it. Symlinks are recreated, not followed.
-        # Other entries are recorded by identity: bwrap resolves each again when it mounts
-        # it, so the runner rejects one the host replaced in between, such as with a symlink.
-        entries: dict[Path, str | tuple[int, int]] = {}
-        for directory, missing in rebuilt.items():
-            listed = 0
-            try:
-                with os.scandir(directory) as scan:
-                    for entry in scan:
-                        path = directory / entry.name
-                        if entry.name in missing or path in present:
-                            continue
-                        if listed == _MAX_REBUILT_ENTRIES:
-                            raise SandboxError(
-                                f"Linux sandbox cannot hide missing denied paths in {directory}: "
-                                f"it holds more than {_MAX_REBUILT_ENTRIES} other entries"
-                            )
-                        listed += 1
-                        try:
-                            if entry.is_symlink():
-                                entries[path] = os.readlink(path)
-                            else:
-                                info = entry.stat(follow_symlinks=False)
-                                entries[path] = (info.st_dev, info.st_ino)
-                        except OSError:
-                            # Changed since it was listed; the next command sees what replaced it.
-                            continue
-            except OSError as exc:
-                raise SandboxError(f"cannot list a directory that holds a missing denied path: {directory}") from exc
-        identities: dict[str, tuple[int, int]] = {}
-        for path in sorted({*mounts, *rebuilt, *entries}, key=lambda item: (len(item.parts), str(item))):
-            if path in rebuilt:
-                argv.extend(["--tmpfs", str(path)])
-                readonly.append(str(path))
-            elif path in mounts:
-                bind(path, path, read_only=mounts[path])
-            elif isinstance(recorded := entries[path], str):
-                argv.extend(["--symlink", recorded, str(path)])
             else:
-                # An entry removed since it was listed is skipped rather than failing the command.
-                argv.extend(["--ro-bind-try", str(path), str(path)])
-                readonly.append(str(path))
-                identities[str(path)] = recorded
-        bind(scratch, scratch, read_only=not writable)
-        for path in dict.fromkeys((*self._grants.helpers, *self._grants.executables, *self._grants.maps)):
-            bind(path, path)
-        argv.extend(["--proc", "/proc", "--dev", "/dev", "--dir", "/var/empty", "--dir", str(_CONTROL)])
+                bind(path, path)
+        for path in self._etc_paths:
+            bind(path.resolve(), path)
+        for profile, store in self._profiles:
+            argv.extend(["--symlink", str(store), str(profile)])
+
+        present = tuple(
+            path
+            for path in self.profile.denied_paths
+            if path.exists()
+            and not any(path != other and path.is_relative_to(other) for other in self.profile.denied_paths)
+        )
+        mounts = {root.path: root.access == RootAccess.READ_ONLY for root in self.roots}
+        for path in _path_ancestors((*present, *self._protected_paths)):
+            if any(path.is_relative_to(root.path) for root in self.roots):
+                mounts.setdefault(path, not self._writable(path))
+        for path in sorted(mounts, key=lambda item: (len(item.parts), str(item))):
+            bind(path, path, read_only=mounts[path])
+        # Scratch is an isolated tmpfs; its host directory is only a unique name.
+        argv.extend(["--tmpfs", str(scratch), "--dev", "/dev", "--dir", "/var/empty"])
+        if not any(root.access == RootAccess.READ_WRITE for root in self.roots):
+            argv.extend(["--remount-ro", str(scratch)])
         if self.profile.ipc:
             argv.extend(["--tmpfs", "/dev/shm"])
-        # Keep the device filesystem from becoming another writable temporary
-        # directory. A separately mounted shared-memory surface remains writable.
-        argv.extend(["--remount-ro", "/dev", "--remount-ro", "/proc"])
-        for name in ("runner.py", "profile.json"):
-            bind(control / name, _CONTROL / name)
-        bind(control / "status", _CONTROL / "status", read_only=False)
-        # Cover denials last; children of an already covered directory add no authority.
-        # A placeholder file can cover any other non-directory, such as a socket or FIFO.
+        argv.extend(["--remount-ro", "/dev"])
         for path in present:
             bind(control / ("deny-dir" if path.is_dir() else "deny-file"), path)
-        argv.extend(
-            [
-                "--chdir",
-                str(self.root),
-                "--",
-                str(self._python),
-                "-I",
-                "-S",
-                str(_CONTROL / "runner.py"),
-                str(_CONTROL / "profile.json"),
-            ]
-        )
-        write_paths = [str(root.path) for root in self.roots if root.access == RootAccess.READ_WRITE]
-        if writable:
-            write_paths.append(str(scratch))
-        write_paths.extend(["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"])
-        if self.profile.ipc:
-            write_paths.append("/dev/shm")
-        profile: dict[str, object] = {
-            "command": command,
-            "process_label": self.process_label,
-            "network": self.profile.network,
-            "ipc": self.profile.ipc,
-            "executables": list(map(str, self._grants.executables)),
-            "executable_trees": list(map(str, self._grants.helpers)),
-            "executable_maps": list(map(str, self._grants.maps)),
-            "readonly_mounts": readonly,
-            "entry_identities": identities,
-            "read_directories": [str(root.path) for root in self.roots]
-            + list(map(str, self._runtime_trees))
-            + [str(scratch), "/dev", "/proc"]
-            + [str(path) for path in self._grants.data if path.is_dir()]
-            + [str(path) for path in _NETWORK_PATHS if self.profile.network and path.is_dir()],
-            "write_paths": write_paths,
-            "timeout_seconds": self.timeout_seconds,
-            "process_limit": self._process_limit,
-            "max_open_files": MAX_OPEN_FILES,
-        }
-        return argv, profile
+        # Only explicit writable mounts offer storage; synthetic ancestors stay read-only.
+        argv.extend(["--remount-ro", "/", "--chdir", str(self.root)])
+        argv.extend(["--", str(self._shell), "--noprofile", "--norc", "-c", command, self.process_label])
+        return argv
 
     async def run(self, command: str) -> CommandResult:
         validate_command(command)
-        if not self._bwrap.is_file() or not self._python.is_file():
-            raise SandboxError("Linux sandbox requires /usr/bin/bwrap and /usr/bin/python3")
+        if reason := check_command(command, self.tools):
+            return CommandResult(exit_code=126, stdout="", stderr=f"localmcp: {reason}")
         await asyncio.to_thread(self._validate_paths)
         with (
             tempfile.TemporaryDirectory(prefix="localmcp-", dir=self._scratch_parent) as scratch_name,
@@ -555,28 +298,39 @@ class LinuxSandbox(CommandRuntime):
             scratch, control = Path(scratch_name), Path(control_name)
             _check_scratch(scratch, self.roots)
             _check_scratch(control, self.roots)
-            (control / "runner.py").write_bytes(_RUNNER_SOURCE)
-            (control / "status").touch(mode=0o600)
             (control / "deny-file").touch(mode=0o000)
             (control / "deny-dir").mkdir(mode=0o000)
-            # Planning lists rebuilt directories, so keep that filesystem work off the event loop.
-            argv, profile = await asyncio.to_thread(self._invocation, command, scratch, control)
-            (control / "profile.json").write_text(json.dumps(profile))
-            # bwrap's info FD reports the host PID of our namespace init, never a workload-owned FD.
-            with (control / "info").open("w+b") as info:
-                argv[1:1] = ["--info-fd", str(info.fileno())]
+            argv = await asyncio.to_thread(self._invocation, command, scratch, control)
+            with (
+                (control / "info").open("w+b") as info,
+                (control / "status").open("w+b") as status,
+                (control / "seccomp").open("w+b") as seccomp,
+            ):
+                seccomp.write(self._seccomp_filter)
+                seccomp.flush()
+                seccomp.seek(0)
+                argv[1:1] = [
+                    "--info-fd",
+                    str(info.fileno()),
+                    "--json-status-fd",
+                    str(status.fileno()),
+                    "--seccomp",
+                    str(seccomp.fileno()),
+                ]
+                maximum_processes = await asyncio.to_thread(owned_process_limit)
+                argv = limited_command(argv, self.timeout_seconds, maximum_processes)
                 try:
                     process = await asyncio.create_subprocess_exec(
                         *argv,
-                        env=command_environment(scratch),
+                        env=command_environment(scratch, bin_directories=self._bin_directories),
                         cwd=self.root,
                         stdin=asyncio.subprocess.DEVNULL,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         start_new_session=True,
-                        pass_fds=(info.fileno(),),
+                        pass_fds=(info.fileno(), status.fileno(), seccomp.fileno()),
                     )
-                except OSError as exc:
+                except (OSError, ValueError, subprocess.SubprocessError) as exc:
                     raise SandboxError(f"cannot start Linux sandbox: {exc}") from exc
                 stdout, stderr = bytearray(), bytearray()
                 try:
@@ -596,17 +350,18 @@ class LinuxSandbox(CommandRuntime):
                     await self._kill(process, control / "info")
                     raise
                 try:
-                    status = json.loads((control / "status").read_text())
-                    if "error" in status:
-                        raise SandboxError(f"Linux sandbox setup failed: {status['error']}")
-                    exit_code = status["exit_code"]
-                    if not isinstance(exit_code, int) or process.returncode != 0:
-                        raise ValueError("invalid supervisor exit")
+                    records = [json.loads(line) for line in (control / "status").read_text().splitlines()]
+                    exits = [record["exit-code"] for record in records if "exit-code" in record]
+                    if len(exits) != 1 or type(exits[0]) is not int or exits[0] != process.returncode:
+                        raise ValueError("missing or inconsistent bubblewrap exit status")
                 except (OSError, ValueError, KeyError, TypeError) as exc:
                     detail = stderr.decode(errors="replace").strip()
                     raise SandboxError(f"Linux sandbox setup or supervision failed: {detail}") from exc
+                assert process.returncode is not None
                 return CommandResult(
-                    exit_code=exit_code, stdout=stdout.decode(errors="replace"), stderr=stderr.decode(errors="replace")
+                    exit_code=process.returncode,
+                    stdout=stdout.decode(errors="replace"),
+                    stderr=stderr.decode(errors="replace"),
                 )
 
     @staticmethod

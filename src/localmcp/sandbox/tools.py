@@ -23,11 +23,12 @@ DEFAULT_EXHAUSTED_MESSAGE = "Source-tool budget exhausted. Produce the final str
 
 
 def _tool_description(tools: tuple[str, ...]) -> str:
-    commands = "Only shell builtins can run."
+    commands = "Only supported shell builtins can be named as commands."
     if tools:
-        commands = f"Besides shell builtins, only these commands can run: {', '.join(tools)}."
+        commands = f"Use supported shell builtins or these literal command names: {', '.join(tools)}."
     return (
         f"Run a command in the policy-bound filesystem roots. {commands} "
+        "Use bare command names; paths, dynamic command names, and unsupported Bash syntax are rejected. "
         "No credentials or caller environment are inherited."
     )
 

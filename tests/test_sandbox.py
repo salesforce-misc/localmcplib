@@ -4,6 +4,7 @@ import json
 import os
 import re
 import resource
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -42,7 +43,7 @@ def system_bin(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPat
     return system
 
 
-_SHELL = (Path("/bin/sh"), Path("/bin/bash"))
+_SHELL = (Path("/bin/bash"), Path("/bin/sh"))
 # Root reads and lists files regardless of their permissions.
 _unprivileged = pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
 
@@ -439,13 +440,45 @@ async def test_run_validates_command_and_builds_bounded_shell_invocation(
     result = await sandbox.run("printf ok")
 
     assert result.stdout == "ok"
+    assert captured[0] == "/bin/bash"
     assert "ulimit -t 1 && ulimit -n 256 && ulimit -u 42" in captured[2]
+    assert 'exec /bin/bash --noprofile --norc -c "$1"' in captured[2]
     assert captured[-2:] == [sandbox.process_label, "printf ok"]
 
     sandbox._process_limit = None
     captured.clear()
     await sandbox.run("true")
     assert "ulimit -u" not in captured[2]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "echo before; ls",
+        "echo $(ls)",
+        "/bin/cat file",
+        "$tool file",
+        "exec cat file",
+        "xcrun_db=/tmp/cache cat file",
+        "read xcrun_db",
+    ],
+)
+async def test_run_rejects_the_entire_command_before_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, command: str
+) -> None:
+    sandbox = MacOSSandbox(SandboxProfile((SandboxRoot(tmp_path),), tools=("cat",)))
+
+    async def execute(_argv: list[str]) -> CommandResult:
+        pytest.fail("a rejected command must never reach the backend launcher")
+
+    monkeypatch.setattr(sandbox, "_execute", execute)
+    result = await sandbox.run(command)
+
+    assert result.exit_code == 126
+    assert result.stdout == ""
+    assert result.stderr.startswith("localmcp: ")
+    assert not result.timed_out
+    assert not result.truncated
 
 
 def test_environment_ignores_the_caller_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -546,6 +579,22 @@ async def test_execute_passes_complete_policy_and_returns_output(
     assert captured["kwargs"]["cwd"] == tmp_path
     assert captured["kwargs"]["start_new_session"] is True
     assert captured["kwargs"]["env"]["HOME"] == "/var/empty"
+
+
+@pytest.mark.parametrize(("returncode", "expected"), [(-signal.SIGTERM, 143), (143, 143), (-signal.SIGKILL, 137)])
+async def test_execute_uses_shell_exit_codes_for_signals_and_preserves_explicit_statuses(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, returncode: int, expected: int
+) -> None:
+    async def read_output(_process: _Process, _stdout: bytearray, _stderr: bytearray) -> None:
+        pass
+
+    sandbox, _process, _captured = await _prepare_execute(monkeypatch, tmp_path, read_output, returncode=returncode)
+
+    result = await sandbox._execute(["/bin/bash", "-c", "true"])
+
+    assert result.exit_code == expected
+    assert not result.timed_out
+    assert not result.truncated
 
 
 @pytest.mark.asyncio
@@ -1120,19 +1169,21 @@ def test_tools_reject_programs_they_run_inside_a_root(tmp_path: Path, system_bin
         MacOSSandbox(SandboxProfile((SandboxRoot(interpreters),), tools=("script",)))
 
 
-def test_shell_runs_the_selected_shell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_script_shell_grants_include_bash_and_the_system_selected_shell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     selected = tmp_path / "zsh"
     selected.touch(mode=0o755)
     selection = tmp_path / "sh"
     selection.symlink_to(selected)
     monkeypatch.setattr(seatbelt, "_SHELL_SELECTION", selection)
 
-    assert seatbelt._shell_executables() == (Path("/bin/sh"), selected.resolve())
+    assert set(seatbelt._shell_executables()) == {Path("/bin/sh"), Path("/bin/bash"), selected.resolve()}
     selection.unlink()
     assert seatbelt._shell_executables() == _SHELL
-    monkeypatch.setattr(seatbelt, "_SHELL", selected.resolve())
-    selection.symlink_to(selected)
-    assert seatbelt._shell_executables() == (selected.resolve(),)
+    selection.symlink_to("/bin/bash")
+    # On merged-/usr Linux hosts the selected shell resolves to /usr/bin/bash.
+    assert seatbelt._shell_executables() == tuple(dict.fromkeys((*_SHELL, Path("/bin/bash").resolve())))
 
 
 @pytest.mark.parametrize(
@@ -1271,8 +1322,9 @@ def test_sandbox_tool_description_names_the_granted_tools(tmp_path: Path) -> Non
 
     plain = description()
     assert plain == seatbelt.DEFAULT_TOOL_DESCRIPTION
-    assert f"Besides shell builtins, only these commands can run: {', '.join(INSPECTION_TOOLS)}." in plain
-    assert "only these commands can run: ls, cat." in description(tools=("ls", "cat", "ls"))
+    assert f"Use supported shell builtins or these literal command names: {', '.join(INSPECTION_TOOLS)}." in plain
+    assert "Use bare command names; paths, dynamic command names, and unsupported Bash syntax are rejected." in plain
+    assert "these literal command names: ls, cat." in description(tools=("ls", "cat", "ls"))
     # Only the optional tools that are installed are offered.
-    assert "only these commands can run: ls, cat." in description(tools=("ls",), optional_tools=("rg", "cat"))
-    assert "Only shell builtins can run." in description(tools=())
+    assert "these literal command names: ls, cat." in description(tools=("ls",), optional_tools=("rg", "cat"))
+    assert "Only supported shell builtins can be named as commands." in description(tools=())
