@@ -17,6 +17,8 @@ from localmcp.sandbox.runtime import command_environment
 _LANGUAGE = Language(tree_sitter_bash.language())
 _COMMAND_NAME = re.compile(rb"(?:[A-Za-z0-9_][A-Za-z0-9_.+:-]*|:)")
 _VARIABLE_NAME = re.compile(rb"[A-Za-z_][A-Za-z0-9_]*")
+# Bash skips flags, width, precision, and length modifiers such as `l` or `z` before a conversion.
+_PRINTF_ASSIGNMENT = re.compile(r"%%|%[^%a-zA-Z]*[hjlLqtzZ]*n")
 _ENVIRONMENT_VARIABLES = frozenset(
     name.encode() for name in command_environment(Path("/"), developer_directory=Path("/"))
 )
@@ -231,7 +233,7 @@ def _builtin_reason(name: str, arguments: list[Node]) -> str | None:
         formats = literals[1:] if literals[:1] == ["--"] else literals
         if not formats or formats[0] is None or formats[0].startswith("-"):
             return "printf requires a literal format and cannot assign variables"
-        if re.search(r"%[^%a-zA-Z]*n", formats[0]):
+        if any(match.group() != "%%" for match in _PRINTF_ASSIGNMENT.finditer(formats[0])):
             return "printf cannot assign variables with %n"
     elif name == "read":
         names = literals[1:] if literals[:1] == ["-r"] else literals
